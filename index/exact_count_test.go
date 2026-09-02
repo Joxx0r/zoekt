@@ -161,6 +161,24 @@ func TestCountSourceLinesIncludesZeroWidthAndNewlineOnlyMatches(t *testing.T) {
 	}
 }
 
+func TestSearchWithExactCountCountsNewlineOnlySourceLines(t *testing.T) {
+	searcher := exactCountSearcherForTest(t,
+		Document{Name: "multiline.go", Content: []byte("first\nsecond\n")},
+		Document{Name: "single.go", Content: []byte("no newline")},
+	)
+	opts := &zoekt.SearchOptions{MaxDocDisplayCount: 1, MaxMatchDisplayCount: 1}
+
+	_, counts, err := searcher.SearchWithExactCount(
+		context.Background(), context.Background(), &query.Substring{Pattern: "\n"}, opts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(&zoekt.ExactSearchCounts{MatchCount: 2, FileCount: 1}, counts); diff != "" {
+		t.Fatalf("newline-only counts mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 	docs := make([]Document, 10)
 	for i := range docs {
