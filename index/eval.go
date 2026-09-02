@@ -136,39 +136,67 @@ func (d *indexData) simplify(in query.Q) query.Q {
 }
 
 func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
+	sr, _, err = d.search(ctx, nil, q, opts)
+	return sr, err
+}
+
+func (d *indexData) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	if countCtx == nil {
+		countCtx = context.Background()
+	}
+	return d.search(ctx, countCtx, q, opts)
+}
+
+func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	timer := newTimer()
 
 	copyOpts := *opts
 	opts = &copyOpts
 	opts.SetDefaults()
 
+	exactRequested := countCtx != nil
+	if exactRequested && opts.MaxDocDisplayCount <= 0 && opts.MaxMatchDisplayCount <= 0 && opts.ShardMaxMatchCount <= 0 {
+		return nil, nil, zoekt.ErrExactCountRequiresBoundedResults
+	}
+	exactComplete := exactRequested && countCtx.Err() == nil
+	exactCounts := zoekt.ExactSearchCounts{}
+	finish := func(result *zoekt.SearchResult) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+		if exactComplete {
+			return result, &exactCounts, nil
+		}
+		return result, nil, nil
+	}
+
 	var res zoekt.SearchResult
 	if len(d.fileNameIndex) == 0 {
-		return &res, nil
+		return finish(&res)
 	}
 
 	select {
 	case <-ctx.Done():
+		if exactRequested {
+			return nil, nil, ctx.Err()
+		}
 		res.Stats.ShardsSkipped++
-		return &res, nil
+		return &res, nil, nil
 	default:
 	}
 
 	q = d.simplify(q)
 	if c, ok := q.(*query.Const); ok && !c.Value {
-		return &res, nil
+		return finish(&res)
 	}
 
 	if opts.EstimateDocCount {
 		res.Stats.ShardFilesConsidered = len(d.fileBranchMasks)
-		return &res, nil
+		return finish(&res)
 	}
 
 	q = query.Map(q, query.ExpandFileContent)
 
 	mt, err := d.newMatchTree(q, matchTreeOpt{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Capture the costs of construction before pruning
@@ -176,12 +204,12 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOpt
 
 	mt, err = pruneMatchTree(mt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res.Stats.MatchTreeConstruction = timer.Elapsed()
 	if mt == nil {
 		res.Stats.ShardsSkippedFilter++
-		return &res, nil
+		return finish(&res)
 	}
 
 	res.Stats.ShardsScanned++
@@ -197,24 +225,29 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOpt
 		lastRepoID     uint16
 		repoMatchCount int
 	)
+	var collector *boundedFileCollector
+	if exactRequested {
+		collector = newBoundedFileCollector(opts)
+	}
+	legacyDone := false
 
 	docCount := uint32(len(d.fileBranchMasks))
 	lastDoc := int(-1)
 
 nextFileMatch:
 	for {
-		canceled := false
-		select {
-		case <-ctx.Done():
-			canceled = true
-		default:
+		requestErr := ctx.Err()
+		if requestErr != nil && exactRequested {
+			return nil, nil, requestErr
 		}
+		canceled := requestErr != nil
 
 		nextDoc := mt.nextDoc()
 		if int(nextDoc) <= lastDoc {
 			nextDoc = uint32(lastDoc + 1)
 		}
 
+		repoLimited := false
 		for ; nextDoc < docCount; nextDoc++ {
 			repoID := d.repos[nextDoc]
 			repoMetadata := &d.repoMetaData[repoID]
@@ -238,11 +271,11 @@ nextFileMatch:
 			}
 
 			// Skip documents over ShardRepoMaxMatchCount if specified.
-			if opts.ShardRepoMaxMatchCount > 0 {
-				if repoMatchCount >= opts.ShardRepoMaxMatchCount && repoID == lastRepoID {
-					res.Stats.FilesSkipped++
-					continue
-				}
+			repoLimited = opts.ShardRepoMaxMatchCount > 0 &&
+				repoMatchCount >= opts.ShardRepoMaxMatchCount && repoID == lastRepoID
+			if repoLimited && !exactComplete {
+				res.Stats.FilesSkipped++
+				continue
 			}
 
 			break
@@ -251,6 +284,21 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
+		if canceled {
+			res.Stats.FilesSkipped += int(docCount - nextDoc)
+			break
+		}
+		if exactComplete && countCtx.Err() != nil {
+			exactComplete = false
+		}
+		if legacyDone && !exactComplete {
+			break
+		}
+		if repoLimited && !exactComplete {
+			res.Stats.FilesSkipped++
+			lastDoc = int(nextDoc)
+			continue
+		}
 
 		lastDoc = int(nextDoc)
 
@@ -258,11 +306,6 @@ nextFileMatch:
 		if lastRepoID != d.repos[nextDoc] {
 			lastRepoID = d.repos[nextDoc]
 			repoMatchCount = 0
-		}
-
-		if canceled || (res.Stats.MatchCount >= opts.ShardMaxMatchCount && opts.ShardMaxMatchCount > 0) {
-			res.Stats.FilesSkipped += int(docCount - nextDoc)
-			break
 		}
 
 		res.Stats.FilesConsidered++
@@ -286,6 +329,41 @@ nextFileMatch:
 			case matchesNone:
 				continue nextFileMatch
 			}
+		}
+		if requestErr := ctx.Err(); requestErr != nil && exactRequested {
+			return nil, nil, requestErr
+		}
+		if exactComplete && countCtx.Err() != nil {
+			exactComplete = false
+			if legacyDone {
+				break
+			}
+		}
+
+		// Important invariant for performance: finalCands is sorted by offset and
+		// non-overlapping. gatherMatches respects this invariant and all later
+		// transformations respect this.
+		finalCands := d.gatherMatches(nextDoc, mt, known)
+
+		if exactComplete {
+			lineCount, complete, countErr := countSourceLines(ctx, countCtx, cp, finalCands)
+			if countErr != nil {
+				return nil, nil, countErr
+			}
+			if complete {
+				exactCounts.MatchCount += lineCount
+				exactCounts.FileCount++
+			} else {
+				exactComplete = false
+			}
+		}
+
+		collectLegacy := !legacyDone && !repoLimited
+		if !collectLegacy {
+			if !exactComplete && legacyDone {
+				break
+			}
+			continue
 		}
 
 		fileMatch := zoekt.FileMatch{
@@ -315,11 +393,6 @@ nextFileMatch:
 			}
 		}
 
-		// Important invariant for performance: finalCands is sorted by offset and
-		// non-overlapping. gatherMatches respects this invariant and all later
-		// transformations respect this.
-		finalCands := d.gatherMatches(nextDoc, mt, known)
-
 		if opts.ChunkMatches {
 			fileMatch.ChunkMatches = cp.fillChunkMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
 		} else {
@@ -348,11 +421,21 @@ nextFileMatch:
 		repoMatchCount += len(fileMatch.LineMatches)
 		repoMatchCount += matchedChunkRanges
 
-		res.Files = append(res.Files, fileMatch)
+		if collector != nil {
+			collector.Add(fileMatch)
+		} else {
+			res.Files = append(res.Files, fileMatch)
+		}
 
 		res.Stats.MatchCount += len(fileMatch.LineMatches)
 		res.Stats.MatchCount += matchedChunkRanges
 		res.Stats.FileCount++
+		if opts.ShardMaxMatchCount > 0 && res.Stats.MatchCount >= opts.ShardMaxMatchCount {
+			legacyDone = true
+		}
+	}
+	if collector != nil {
+		res.Files = collector.Files(opts)
 	}
 
 	for _, md := range d.repoMetaData {
@@ -368,7 +451,7 @@ nextFileMatch:
 
 	res.Stats.MatchTreeSearch = timer.Elapsed()
 
-	return &res, nil
+	return finish(&res)
 }
 
 func addRepo(res *zoekt.SearchResult, repo *zoekt.Repository) {

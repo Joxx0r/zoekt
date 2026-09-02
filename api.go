@@ -919,6 +919,36 @@ type Searcher interface {
 	String() string
 }
 
+// ExactSearchCounts contains complete corpus-wide counts for one search.
+// MatchCount counts distinct matching source lines (or one filename row for a
+// filename-only match), while FileCount counts files containing at least one
+// such row.
+//
+// A CountedSearcher returns a nil *ExactSearchCounts when the optional count
+// context expires. The bounded SearchResult remains usable in that case.
+type ExactSearchCounts struct {
+	MatchCount int
+	FileCount  int
+}
+
+// CountedSearcher performs bounded result selection and exact counting in one
+// traversal over the same search snapshot. ctx owns the request: canceling it
+// aborts the complete operation with an error. countCtx owns only the optional
+// exact counters: canceling it preserves the bounded SearchResult and returns
+// nil counts. Implementations must not return partial counts.
+type CountedSearcher interface {
+	Searcher
+	SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *SearchOptions) (*SearchResult, *ExactSearchCounts, error)
+}
+
+// ErrExactCountUnsupported reports that a Searcher does not implement the
+// optional CountedSearcher contract.
+var ErrExactCountUnsupported = errors.New("zoekt searcher does not support exact counts")
+
+// ErrExactCountRequiresBoundedResults reports that exact counting was
+// requested without any finite result-retention limit.
+var ErrExactCountRequiresBoundedResults = errors.New("zoekt exact count requires bounded search results")
+
 type RepoListField int
 
 const (

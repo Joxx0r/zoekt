@@ -41,6 +41,35 @@ func (s *typeRepoSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	return s.Streamer.Search(ctx, q, opts)
 }
 
+func (s *typeRepoSearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	tr, ctx := trace.New(ctx, "typeRepoSearcher.SearchWithExactCount", "")
+	tr.LazyLog(q, true)
+	tr.LazyPrintf("opts: %+v", opts)
+	tenant.Log(ctx, tr)
+	defer func() {
+		if sr != nil {
+			tr.LazyPrintf("num files: %d", len(sr.Files))
+			tr.LazyPrintf("stats: %+v", sr.Stats)
+		}
+		if err != nil {
+			tr.LazyPrintf("error: %v", err)
+			tr.SetError(err)
+		}
+		tr.Finish()
+	}()
+
+	q, err = s.eval(ctx, tr, q)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	counted, ok := s.Streamer.(zoekt.CountedSearcher)
+	if !ok {
+		return nil, nil, zoekt.ErrExactCountUnsupported
+	}
+	return counted.SearchWithExactCount(ctx, countCtx, q, opts)
+}
+
 func (s *typeRepoSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) (err error) {
 	tr, ctx := trace.New(ctx, "typeRepoSearcher.StreamSearch", "")
 	tr.LazyLog(q, true)
