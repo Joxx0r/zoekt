@@ -170,6 +170,29 @@ func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	}
 }
 
+func TestShardSearchModeUsesExplicitTraversalStates(t *testing.T) {
+	mode := newExactShardSearchMode(context.Background())
+	if mode.state != shardTraversalExactAndLegacy {
+		t.Fatalf("initial state = %v, want exact-and-legacy", mode.state)
+	}
+	if state := mode.stopLegacyResults(); state != shardTraversalExactOnly {
+		t.Fatalf("state after legacy limit = %v, want exact-only", state)
+	}
+	if mode.retainNextResult() {
+		t.Fatal("exact-only traversal retained the next legacy result")
+	}
+	if state := mode.stopLegacyResults(); state != shardTraversalExactOnly {
+		t.Fatalf("repeated legacy limit changed state to %v, want exact-only", state)
+	}
+	mode.observeCounts(nil)
+	if mode.state != shardTraversalDone || !mode.shouldStopAfterResult() {
+		t.Fatalf("state after unavailable exact count = %v, want done", mode.state)
+	}
+	if counts := mode.exactCounts(); counts != nil {
+		t.Fatalf("counts = %#v, want unavailable in done state", counts)
+	}
+}
+
 func TestShardedSearchWithExactCountRequestCancellation(t *testing.T) {
 	ss := newShardedSearcher(1)
 	ss.replace(map[string]zoekt.Searcher{
