@@ -569,9 +569,14 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 
 	loaded := ss.getLoaded()
 	done, err := streamSearch(ctx, proc, q, opts, loaded.shards, collectSender)
-	defer done()
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return nil, err
+	}
+	if done != nil {
+		defer done()
 	}
 
 	aggregate, ok := collectSender.Done()
@@ -632,9 +637,14 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 
 	loaded := ss.getLoaded()
 	done, err := streamSearchInternal(ctx, proc, q, opts, loaded.shards, collectSender, mode)
-	defer done()
 	if err != nil {
+		if done != nil {
+			done()
+		}
 		return nil, nil, err
+	}
+	if done != nil {
+		defer done()
 	}
 
 	aggregate, ok := collectSender.Done()

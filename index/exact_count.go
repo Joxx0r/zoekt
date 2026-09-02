@@ -109,6 +109,7 @@ func (m *indexSearchMode) finish(result *zoekt.SearchResult, opts *zoekt.SearchO
 	if m.collector != nil {
 		result.Files = m.collector.Files(opts)
 	}
+	m.refreshCountBudget()
 	if m.countComplete {
 		return result, &m.counts, nil
 	}

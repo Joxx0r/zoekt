@@ -234,6 +234,26 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 	})
 }
 
+func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
+	countCtx := newErrAfterContext(1)
+	mode, err := newIndexSearchMode(countCtx, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode.counts = zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}
+
+	result, counts, err := mode.finish(&zoekt.SearchResult{}, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("bounded result unexpectedly nil")
+	}
+	if counts != nil {
+		t.Fatalf("counts = %#v, want unavailable after final budget check", counts)
+	}
+}
+
 func TestSearchWithExactCountRequestCancellationAborts(t *testing.T) {
 	searcher := exactCountSearcherForTest(t,
 		Document{Name: "a.go", Content: []byte("needle\n")},
