@@ -266,6 +266,16 @@ type directorySearcher struct {
 	directoryWatcher *DirectoryWatcher
 }
 
+// SearchWithExactCount forwards the zoekt.CountedSearcher contract while the
+// directory watcher owns the underlying streamer's lifecycle.
+func (s *directorySearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+	counted, ok := s.Streamer.(zoekt.CountedSearcher)
+	if !ok {
+		return nil, nil, zoekt.ErrExactCountUnsupported
+	}
+	return counted.SearchWithExactCount(ctx, countCtx, q, opts)
+}
+
 func (s *directorySearcher) Close() {
 	// We need to Stop directoryWatcher first since it calls load/unload on
 	// Searcher.
@@ -529,7 +539,31 @@ func doSelectRepoSet(shards []*rankedShard, and *query.And) ([]*rankedShard, que
 }
 
 func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
-	tr, ctx := trace.New(ctx, "shardedSearcher.Search", "")
+	sr, _, err = ss.search(ctx, nil, q, opts)
+	return sr, err
+}
+
+// SearchWithExactCount implements zoekt.CountedSearcher across all selected
+// shards while retaining only the bounded legacy result window.
+func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	if err := validateExactCountOptions(opts); err != nil {
+		return nil, nil, err
+	}
+	if countCtx == nil {
+		countCtx = context.Background()
+	}
+	return ss.search(ctx, countCtx, q, opts)
+}
+
+func (ss *shardedSearcher) search(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	traceName := "shardedSearcher.Search"
+	mode := newLegacyShardSearchMode()
+	if countCtx != nil {
+		traceName = "shardedSearcher.SearchWithExactCount"
+		mode = newExactShardSearchMode(countCtx)
+	}
+
+	tr, ctx := trace.New(ctx, traceName, "")
 	tr.LazyLog(q, true)
 	tr.LazyPrintf("opts: %+v", opts)
 	defer func() {
@@ -551,7 +585,7 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	start := time.Now()
 	proc, err := ss.sched.Acquire(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer proc.Release()
 	tr.LazyPrintf("acquired process")
@@ -560,10 +594,15 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	start = time.Now()
 
 	loaded := ss.getLoaded()
-	done, err := streamSearch(ctx, proc, q, opts, loaded.shards, collectSender)
-	defer done()
+	done, err := streamSearchInternal(ctx, proc, q, opts, loaded.shards, collectSender, mode)
 	if err != nil {
-		return nil, err
+		if done != nil {
+			done()
+		}
+		return nil, nil, err
+	}
+	if done != nil {
+		defer done()
 	}
 
 	aggregate, ok := collectSender.Done()
@@ -577,14 +616,20 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	copyFiles(aggregate)
 
 	if !loaded.ready {
-		// We may have missed results due to not being fully loaded.
 		aggregate.Stats.Crashes++
+		mode.invalidateCounts()
 	}
 
 	aggregate.Stats.Wait = wait
 	aggregate.Stats.Duration = time.Since(start)
+	if countCtx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+	counts = mode.exactCounts()
 
-	return aggregate, nil
+	return aggregate, counts, nil
 }
 
 func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) (err error) {
@@ -658,6 +703,225 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	return err
 }
 
+// shardSearchMode centralizes the policy differences between a bounded legacy
+// search and an exact-count traversal. A legacy mode never schedules shards
+// after its display limit; an exact mode may keep scheduling them as
+// count-only work while its independent count context remains valid.
+type shardSearchMode struct {
+	countCtx       context.Context
+	counts         zoekt.ExactSearchCounts
+	countingActive bool
+	retainResults  bool
+}
+
+func newLegacyShardSearchMode() *shardSearchMode {
+	return &shardSearchMode{retainResults: true}
+}
+
+func newExactShardSearchMode(countCtx context.Context) *shardSearchMode {
+	return &shardSearchMode{
+		countCtx:       countCtx,
+		countingActive: countCtx.Err() == nil,
+		retainResults:  true,
+	}
+}
+
+func (m *shardSearchMode) exactRequested() bool {
+	return m.countCtx != nil
+}
+
+func (m *shardSearchMode) search(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+	if !m.exactRequested() {
+		result, err := searchOneShard(ctx, s, q, opts)
+		return result, nil, err
+	}
+	return searchOneShardWithExactCount(ctx, m.countCtx, s, q, opts)
+}
+
+func (m *shardSearchMode) observeCounts(counts *zoekt.ExactSearchCounts) {
+	if !m.countingActive {
+		return
+	}
+	if counts == nil {
+		m.countingActive = false
+		return
+	}
+	m.counts.MatchCount += counts.MatchCount
+	m.counts.FileCount += counts.FileCount
+}
+
+func (m *shardSearchMode) stopLegacyResults() {
+	m.retainResults = false
+}
+
+func (m *shardSearchMode) retainNextResult() bool {
+	return m.retainResults
+}
+
+func (m *shardSearchMode) shouldStopAfterResult() bool {
+	return !m.countingActive && !m.retainResults
+}
+
+func (m *shardSearchMode) invalidateCounts() {
+	m.countingActive = false
+}
+
+func (m *shardSearchMode) exactCounts() *zoekt.ExactSearchCounts {
+	if m.exactRequested() && m.countCtx.Err() != nil {
+		m.invalidateCounts()
+	}
+	if m.countingActive {
+		return &m.counts
+	}
+	return nil
+}
+
+func validateExactCountOptions(opts *zoekt.SearchOptions) error {
+	normalized := *opts
+	normalized.SetDefaults()
+	if normalized.MaxDocDisplayCount <= 0 && normalized.MaxMatchDisplayCount <= 0 && normalized.ShardMaxMatchCount <= 0 {
+		return zoekt.ErrExactCountRequiresBoundedResults
+	}
+	return nil
+}
+
+type shardSearchWork struct {
+	shard         *rankedShard
+	retainResults bool
+}
+
+type shardSearchResult struct {
+	priority      float64
+	retainResults bool
+	*zoekt.SearchResult
+	exactCounts *zoekt.ExactSearchCounts
+	err         error
+}
+
+type shardSearchCoordinator struct {
+	mode            *shardSearchMode
+	opts            *zoekt.SearchOptions
+	sender          zoekt.Sender
+	shards          []*rankedShard
+	search          chan *shardSearchWork
+	work            chan *shardSearchWork
+	pending         prioritySlice
+	nextShard       int
+	next            *shardSearchWork
+	totalMatchCount int
+}
+
+func newShardSearchCoordinator(mode *shardSearchMode, opts *zoekt.SearchOptions, sender zoekt.Sender, shards []*rankedShard, search chan *shardSearchWork, workers int) *shardSearchCoordinator {
+	coordinator := &shardSearchCoordinator{
+		mode:    mode,
+		opts:    opts,
+		sender:  sender,
+		shards:  shards,
+		search:  search,
+		work:    search,
+		pending: make(prioritySlice, 0, workers),
+	}
+	if len(shards) == 0 {
+		coordinator.stop()
+		return coordinator
+	}
+	coordinator.nextShard = 1
+	coordinator.next = &shardSearchWork{shard: shards[0], retainResults: true}
+	return coordinator
+}
+
+func (c *shardSearchCoordinator) stop() {
+	if c.work == nil {
+		return
+	}
+	close(c.search)
+	c.work = nil
+	c.next = nil
+}
+
+func (c *shardSearchCoordinator) stopLegacy() {
+	c.mode.stopLegacyResults()
+	if c.mode.shouldStopAfterResult() {
+		c.stop()
+		return
+	}
+	if c.next != nil {
+		c.next.retainResults = false
+	}
+}
+
+func (c *shardSearchCoordinator) dispatched() {
+	if c.next.retainResults {
+		c.pending.append(c.next.shard.priority)
+	}
+	if c.nextShard == len(c.shards) {
+		c.stop()
+		return
+	}
+	c.next = &shardSearchWork{
+		shard:         c.shards[c.nextShard],
+		retainResults: c.mode.retainNextResult(),
+	}
+	c.nextShard++
+}
+
+func (c *shardSearchCoordinator) consume(result *shardSearchResult) error {
+	if result.retainResults {
+		c.pending.remove(result.priority)
+	}
+	if result.err != nil {
+		c.stop()
+		return result.err
+	}
+
+	c.mode.observeCounts(result.exactCounts)
+	if result.retainResults {
+		c.totalMatchCount += result.SearchResult.Stats.MatchCount
+		if c.opts.TotalMaxMatchCount > 0 && c.totalMatchCount > c.opts.TotalMaxMatchCount {
+			c.stopLegacy()
+		}
+	}
+
+	observeMetrics(result.SearchResult)
+	if result.retainResults {
+		result.Priority = result.priority
+		result.MaxPendingPriority = c.pending.max()
+		sendByRepository(result.SearchResult, c.opts, c.sender)
+	}
+	if c.mode.shouldStopAfterResult() {
+		c.stop()
+	}
+	return nil
+}
+
+func startShardSearchWorkers(ctx context.Context, workers int, mode *shardSearchMode, q query.Q, opts *zoekt.SearchOptions) (chan *shardSearchWork, <-chan *shardSearchResult) {
+	search := make(chan *shardSearchWork, workers)
+	results := make(chan *shardSearchResult, workers)
+	var wg sync.WaitGroup
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for work := range search {
+				sr, counts, err := mode.search(ctx, work.shard.Searcher, q, opts)
+				results <- &shardSearchResult{
+					priority:      work.shard.priority,
+					retainResults: work.retainResults,
+					SearchResult:  sr,
+					exactCounts:   counts,
+					err:           err,
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return search, results
+}
+
 // streamSearch is an internal helper since both Search and StreamSearch are
 // largely similar.
 //
@@ -667,6 +931,10 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 // to collect those shards. The caller must call copyFiles on any
 // SearchResults it returns/streams out before calling done.
 func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender) (done func(), err error) {
+	return streamSearchInternal(ctx, proc, q, opts, shards, sender, newLegacyShardSearchMode())
+}
+
+func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender, mode *shardSearchMode) (done func(), err error) {
 	tr, ctx := trace.New(ctx, "shardedSearcher.streamSearch", "")
 	overallStart := time.Now()
 	metricSearchRunning.Inc()
@@ -707,64 +975,10 @@ func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.Sea
 	// whichever is smaller.
 	workers := min(runtime.GOMAXPROCS(0), len(shards))
 
-	type result struct {
-		priority float64
-		*zoekt.SearchResult
-		err error
-	}
-
-	var (
-		// buffered channels to continue searching when sending back results
-		// takes a while / blocks. The maximum pending result set is workers * 2.
-		results = make(chan *result, workers)
-		search  = make(chan *rankedShard, workers)
-		wg      sync.WaitGroup
-	)
-
-	// Start workers that receive shards from the search channel, search them,
-	// and send the results to the results channel. This process is repeated
-	// until the search channel is closed.
-	//
-	// Note: Making "search" a buffered channel has the effect of limiting the number of parallel shard searches.
-	// Since searching is mostly CPU bound, limiting parallel shard searches also reduces the peak working set.
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for s := range search {
-				sr, err := searchOneShard(ctx, s, q, opts)
-				r := &result{priority: s.priority, SearchResult: sr, err: err}
-				results <- r
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var (
-		pending = make(prioritySlice, 0, workers)
-		shard   = 0
-		next    = shards[shard]
-
-		// We need a separate nil-able reference to the same channel so we can close(search) for the worker
-		// go-routines to finish but also set work to nil in order for the select statement below to ignore
-		// that case when we want to stop a search. This is needed because sending on a closed channel panics.
-		work = search
-	)
-
-	stop := func() {
-		if work != nil {
-			close(search)
-			work = nil
-			next = nil
-		}
-	}
-
-	// tracked so we can stop when we hit TotalMaxMatchCount
-	var totalMatchCount int
+	// Buffered work lets shard searches continue while result delivery blocks,
+	// while still bounding concurrent shard memory to the worker count.
+	search, results := startShardSearchWorkers(ctx, workers, mode, q, opts)
+	coordinator := newShardSearchCoordinator(mode, opts, sender, shards, search, workers)
 
 search:
 	for {
@@ -773,44 +987,16 @@ search:
 		_ = proc.Yield(ctx) // Note: we let searchOneShard handle context errors
 
 		select {
-		case work <- next: // is there a worker available to search the next shard?
-			pending.append(next.priority)
-
-			shard++
-			if shard == len(shards) {
-				stop()
-			} else {
-				next = shards[shard]
-			}
+		case coordinator.work <- coordinator.next: // is there a worker available to search the next shard?
+			coordinator.dispatched()
 		case r, ok := <-results: // is there a result to send back?
 			if !ok {
 				break search
 			}
-
-			// delete this result's priority from pending before computing the new max pending priority
-			pending.remove(r.priority)
-
-			if r.err != nil {
-				// Set final error and stop searching new shards, but consume any pending
-				// search results.
-				stop()
-				err = r.err
-				continue
+			if resultErr := coordinator.consume(r); resultErr != nil {
+				// Stop scheduling new shards but drain results already in flight.
+				err = resultErr
 			}
-
-			// Update the match count statistics and stop searching new shards if we've
-			// reached the limit set in the options.
-			totalMatchCount += r.SearchResult.Stats.MatchCount
-			if opts.TotalMaxMatchCount > 0 && totalMatchCount > opts.TotalMaxMatchCount {
-				stop()
-			}
-
-			observeMetrics(r.SearchResult)
-
-			r.Priority = r.priority
-			r.MaxPendingPriority = pending.max()
-
-			sendByRepository(r.SearchResult, opts, sender) // send the result back to the client
 		}
 	}
 
@@ -928,6 +1114,24 @@ func copyFiles(sr *zoekt.SearchResult) {
 }
 
 func searchOneShard(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
+	sr, _, err = runShardSearch(s, func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+		result, searchErr := s.Search(ctx, q, opts)
+		return result, nil, searchErr
+	})
+	return sr, err
+}
+
+func searchOneShardWithExactCount(ctx, countCtx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	return runShardSearch(s, func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+		counted, ok := s.(zoekt.CountedSearcher)
+		if !ok {
+			return nil, nil, zoekt.ErrExactCountUnsupported
+		}
+		return counted.SearchWithExactCount(ctx, countCtx, q, opts)
+	})
+}
+
+func runShardSearch(s zoekt.Searcher, search func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error)) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	metricSearchShardRunning.Inc()
 	defer func() {
 		metricSearchShardRunning.Dec()
@@ -938,10 +1142,10 @@ func searchOneShard(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoek
 				sr = &zoekt.SearchResult{}
 			}
 			sr.Stats.Crashes = 1
+			counts = nil
 		}
 	}()
-
-	return s.Search(ctx, q, opts)
+	return search()
 }
 
 type shardListResult struct {

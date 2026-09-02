@@ -136,39 +136,61 @@ func (d *indexData) simplify(in query.Q) query.Q {
 }
 
 func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
+	sr, _, err = d.search(ctx, nil, q, opts)
+	return sr, err
+}
+
+// SearchWithExactCount implements zoekt.CountedSearcher with an independent
+// context for the complete corpus-wide count traversal.
+func (d *indexData) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	if countCtx == nil {
+		countCtx = context.Background()
+	}
+	return d.search(ctx, countCtx, q, opts)
+}
+
+func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	timer := newTimer()
 
 	copyOpts := *opts
 	opts = &copyOpts
 	opts.SetDefaults()
 
+	mode, err := newIndexSearchMode(countCtx, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var res zoekt.SearchResult
 	if len(d.fileNameIndex) == 0 {
-		return &res, nil
+		return mode.finish(ctx, &res, opts)
 	}
 
 	select {
 	case <-ctx.Done():
+		if mode.exactRequested() {
+			return nil, nil, ctx.Err()
+		}
 		res.Stats.ShardsSkipped++
-		return &res, nil
+		return &res, nil, nil
 	default:
 	}
 
 	q = d.simplify(q)
 	if c, ok := q.(*query.Const); ok && !c.Value {
-		return &res, nil
+		return mode.finish(ctx, &res, opts)
 	}
 
-	if opts.EstimateDocCount {
+	if opts.EstimateDocCount && !mode.exactRequested() {
 		res.Stats.ShardFilesConsidered = len(d.fileBranchMasks)
-		return &res, nil
+		return mode.finish(ctx, &res, opts)
 	}
 
 	q = query.Map(q, query.ExpandFileContent)
 
 	mt, err := d.newMatchTree(q, matchTreeOpt{})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Capture the costs of construction before pruning
@@ -176,12 +198,12 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOpt
 
 	mt, err = pruneMatchTree(mt)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	res.Stats.MatchTreeConstruction = timer.Elapsed()
 	if mt == nil {
 		res.Stats.ShardsSkippedFilter++
-		return &res, nil
+		return mode.finish(ctx, &res, opts)
 	}
 
 	res.Stats.ShardsScanned++
@@ -197,24 +219,17 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOpt
 		lastRepoID     uint16
 		repoMatchCount int
 	)
-
 	docCount := uint32(len(d.fileBranchMasks))
 	lastDoc := int(-1)
 
 nextFileMatch:
 	for {
-		canceled := false
-		select {
-		case <-ctx.Done():
-			canceled = true
-		default:
-		}
-
 		nextDoc := mt.nextDoc()
 		if int(nextDoc) <= lastDoc {
 			nextDoc = uint32(lastDoc + 1)
 		}
 
+		repoLimited := false
 		for ; nextDoc < docCount; nextDoc++ {
 			repoID := d.repos[nextDoc]
 			repoMetadata := &d.repoMetaData[repoID]
@@ -238,11 +253,11 @@ nextFileMatch:
 			}
 
 			// Skip documents over ShardRepoMaxMatchCount if specified.
-			if opts.ShardRepoMaxMatchCount > 0 {
-				if repoMatchCount >= opts.ShardRepoMaxMatchCount && repoID == lastRepoID {
-					res.Stats.FilesSkipped++
-					continue
-				}
+			repoLimited = opts.ShardRepoMaxMatchCount > 0 &&
+				repoMatchCount >= opts.ShardRepoMaxMatchCount && repoID == lastRepoID
+			if mode.shouldSkipRepoLimited(repoLimited) {
+				res.Stats.FilesSkipped++
+				continue
 			}
 
 			break
@@ -251,6 +266,14 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
+		stop, err := mode.shouldStopBeforeDocument(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if stop {
+			res.Stats.FilesSkipped += int(docCount - nextDoc)
+			break nextFileMatch
+		}
 
 		lastDoc = int(nextDoc)
 
@@ -258,11 +281,6 @@ nextFileMatch:
 		if lastRepoID != d.repos[nextDoc] {
 			lastRepoID = d.repos[nextDoc]
 			repoMatchCount = 0
-		}
-
-		if canceled || (res.Stats.MatchCount >= opts.ShardMaxMatchCount && opts.ShardMaxMatchCount > 0) {
-			res.Stats.FilesSkipped += int(docCount - nextDoc)
-			break
 		}
 
 		res.Stats.FilesConsidered++
@@ -287,72 +305,26 @@ nextFileMatch:
 				continue nextFileMatch
 			}
 		}
-
-		fileMatch := zoekt.FileMatch{
-			Repository:         md.Name,
-			RepositoryID:       md.ID,
-			RepositoryPriority: md.GetPriority(),
-			FileName:           string(d.fileName(nextDoc)),
-			Checksum:           d.getChecksum(nextDoc),
-			Language:           d.languageMap[d.getLanguage(nextDoc)],
-		}
-
-		if s := d.subRepos[nextDoc]; s > 0 {
-			if s >= uint32(len(d.subRepoPaths[d.repos[nextDoc]])) {
-				log.Panicf("corrupt index: subrepo %d beyond %v", s, d.subRepoPaths)
-			}
-			path := d.subRepoPaths[d.repos[nextDoc]][s]
-			fileMatch.SubRepositoryPath = path
-			sr := md.SubRepoMap[path]
-			fileMatch.SubRepositoryName = sr.Name
-			if idx := d.branchIndex(nextDoc); idx >= 0 {
-				fileMatch.Version = sr.Branches[idx].Version
-			}
-		} else {
-			idx := d.branchIndex(nextDoc)
-			if idx >= 0 {
-				fileMatch.Version = md.Branches[idx].Version
-			}
-		}
-
 		// Important invariant for performance: finalCands is sorted by offset and
 		// non-overlapping. gatherMatches respects this invariant and all later
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		if opts.ChunkMatches {
-			fileMatch.ChunkMatches = cp.fillChunkMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
-		} else {
-			fileMatch.LineMatches = cp.fillMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
+		collect, stop, err := mode.afterMatch(ctx, repoLimited, cp, finalCands)
+		if err != nil {
+			return nil, nil, err
+		}
+		if stop {
+			res.Stats.FilesSkipped += int(docCount - nextDoc)
+			break
+		}
+		if !collect {
+			continue
 		}
 
-		if opts.UseBM25Scoring {
-			d.scoreFileBM25(&fileMatch, nextDoc, finalCands, cp, opts)
-		} else {
-			// Use the standard, non-experimental scoring method by default
-			d.scoreFile(&fileMatch, nextDoc, mt, known, opts)
-		}
-
-		fileMatch.Branches = d.gatherBranches(nextDoc, mt, known)
-		sortMatchesByScore(fileMatch.LineMatches)
-		sortChunkMatchesByScore(fileMatch.ChunkMatches)
-		if opts.Whole {
-			fileMatch.Content = cp.data(false)
-		}
-
-		matchedChunkRanges := 0
-		for _, cm := range fileMatch.ChunkMatches {
-			matchedChunkRanges += len(cm.Ranges)
-		}
-
-		repoMatchCount += len(fileMatch.LineMatches)
-		repoMatchCount += matchedChunkRanges
-
-		res.Files = append(res.Files, fileMatch)
-
-		res.Stats.MatchCount += len(fileMatch.LineMatches)
-		res.Stats.MatchCount += matchedChunkRanges
-		res.Stats.FileCount++
+		fileMatch, matchCount := d.renderFileMatch(nextDoc, md, mt, known, cp, finalCands, opts)
+		repoMatchCount += matchCount
+		mode.addLegacyResult(&res, fileMatch, matchCount, opts)
 	}
 
 	for _, md := range d.repoMetaData {
@@ -368,7 +340,58 @@ nextFileMatch:
 
 	res.Stats.MatchTreeSearch = timer.Elapsed()
 
-	return &res, nil
+	return mode.finish(ctx, &res, opts)
+}
+
+func (d *indexData) renderFileMatch(nextDoc uint32, md zoekt.Repository, mt matchTree, known map[matchTree]bool, cp *contentProvider, finalCands []*candidateMatch, opts *zoekt.SearchOptions) (zoekt.FileMatch, int) {
+	fileMatch := zoekt.FileMatch{
+		Repository:         md.Name,
+		RepositoryID:       md.ID,
+		RepositoryPriority: md.GetPriority(),
+		FileName:           string(d.fileName(nextDoc)),
+		Checksum:           d.getChecksum(nextDoc),
+		Language:           d.languageMap[d.getLanguage(nextDoc)],
+	}
+
+	if subRepo := d.subRepos[nextDoc]; subRepo > 0 {
+		if subRepo >= uint32(len(d.subRepoPaths[d.repos[nextDoc]])) {
+			log.Panicf("corrupt index: subrepo %d beyond %v", subRepo, d.subRepoPaths)
+		}
+		path := d.subRepoPaths[d.repos[nextDoc]][subRepo]
+		fileMatch.SubRepositoryPath = path
+		subRepoMetadata := md.SubRepoMap[path]
+		fileMatch.SubRepositoryName = subRepoMetadata.Name
+		if idx := d.branchIndex(nextDoc); idx >= 0 {
+			fileMatch.Version = subRepoMetadata.Branches[idx].Version
+		}
+	} else if idx := d.branchIndex(nextDoc); idx >= 0 {
+		fileMatch.Version = md.Branches[idx].Version
+	}
+
+	if opts.ChunkMatches {
+		fileMatch.ChunkMatches = cp.fillChunkMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
+	} else {
+		fileMatch.LineMatches = cp.fillMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
+	}
+
+	if opts.UseBM25Scoring {
+		d.scoreFileBM25(&fileMatch, nextDoc, finalCands, cp, opts)
+	} else {
+		d.scoreFile(&fileMatch, nextDoc, mt, known, opts)
+	}
+
+	fileMatch.Branches = d.gatherBranches(nextDoc, mt, known)
+	sortMatchesByScore(fileMatch.LineMatches)
+	sortChunkMatchesByScore(fileMatch.ChunkMatches)
+	if opts.Whole {
+		fileMatch.Content = cp.data(false)
+	}
+
+	matchCount := len(fileMatch.LineMatches)
+	for _, chunk := range fileMatch.ChunkMatches {
+		matchCount += len(chunk.Ranges)
+	}
+	return fileMatch, matchCount
 }
 
 func addRepo(res *zoekt.SearchResult, repo *zoekt.Repository) {
