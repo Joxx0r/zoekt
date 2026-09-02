@@ -1,6 +1,9 @@
 package testutil
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // NewErrAfterContext returns a context whose Err method starts reporting
 // DeadlineExceeded after the requested number of successful checks.
@@ -15,12 +18,16 @@ func NewErrAfterContext(allowed int) context.Context {
 type errAfterContext struct {
 	context.Context
 	allowed int
+	mu      sync.Mutex
 	calls   int
 	done    chan struct{}
 	err     error
 }
 
 func (c *errAfterContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.err != nil {
 		return c.err
 	}

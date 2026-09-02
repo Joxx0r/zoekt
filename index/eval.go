@@ -266,15 +266,12 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
-		action, err := mode.beforeDocument(ctx)
+		stop, err := mode.shouldStopBeforeDocument(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		switch action {
-		case beforeDocumentCanceled:
+		if stop {
 			res.Stats.FilesSkipped += int(docCount - nextDoc)
-			break nextFileMatch
-		case beforeDocumentStop:
 			break nextFileMatch
 		}
 
@@ -313,14 +310,15 @@ nextFileMatch:
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		postAction, err := mode.afterMatch(ctx, repoLimited, cp, finalCands)
+		collect, stop, err := mode.afterMatch(ctx, repoLimited, cp, finalCands)
 		if err != nil {
 			return nil, nil, err
 		}
-		if postAction == afterMatchStop {
+		if stop {
+			res.Stats.FilesSkipped += int(docCount - nextDoc)
 			break
 		}
-		if postAction != afterMatchCollect {
+		if !collect {
 			continue
 		}
 

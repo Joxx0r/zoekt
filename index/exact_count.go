@@ -27,22 +27,6 @@ type indexSearchMode struct {
 	legacyDone    bool
 }
 
-type beforeDocumentAction uint8
-
-const (
-	beforeDocumentContinue beforeDocumentAction = iota
-	beforeDocumentCanceled
-	beforeDocumentStop
-)
-
-type afterMatchAction uint8
-
-const (
-	afterMatchContinue afterMatchAction = iota
-	afterMatchStop
-	afterMatchCollect
-)
-
 func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
 	mode := &indexSearchMode{countCtx: countCtx}
 	if countCtx == nil {
@@ -64,33 +48,30 @@ func (m *indexSearchMode) shouldSkipRepoLimited(repoLimited bool) bool {
 	return repoLimited && !m.countComplete
 }
 
-func (m *indexSearchMode) beforeDocument(ctx context.Context) (beforeDocumentAction, error) {
+func (m *indexSearchMode) shouldStopBeforeDocument(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		if m.exactRequested() {
-			return beforeDocumentContinue, err
+			return false, err
 		}
-		return beforeDocumentCanceled, nil
+		return true, nil
 	}
 	m.refreshCountBudget()
-	if m.legacyDone && !m.countComplete {
-		return beforeDocumentStop, nil
-	}
-	return beforeDocumentContinue, nil
+	return m.legacyDone && !m.countComplete, nil
 }
 
-func (m *indexSearchMode) afterMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (afterMatchAction, error) {
+func (m *indexSearchMode) afterMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (collect, stop bool, err error) {
 	if err := ctx.Err(); err != nil && m.exactRequested() {
-		return afterMatchContinue, err
+		return false, false, err
 	}
 	m.refreshCountBudget()
 	if m.legacyDone && !m.countComplete {
-		return afterMatchStop, nil
+		return false, true, nil
 	}
 
 	if m.countComplete {
 		lineCount, complete, err := countSourceLines(ctx, m.countCtx, cp, matches)
 		if err != nil {
-			return afterMatchContinue, err
+			return false, false, err
 		}
 		if !complete {
 			m.countComplete = false
@@ -100,12 +81,9 @@ func (m *indexSearchMode) afterMatch(ctx context.Context, repoLimited bool, cp *
 		}
 	}
 	if m.legacyDone && !m.countComplete {
-		return afterMatchStop, nil
+		return false, true, nil
 	}
-	if m.legacyDone || repoLimited {
-		return afterMatchContinue, nil
-	}
-	return afterMatchCollect, nil
+	return !m.legacyDone && !repoLimited, false, nil
 }
 
 func (m *indexSearchMode) refreshCountBudget() {

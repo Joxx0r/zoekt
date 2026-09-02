@@ -271,10 +271,10 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 	})
 
 	t.Run("after display window", func(t *testing.T) {
-		// The initial check plus four checks per document cover the first two
-		// documents and their line counts. Expiring on the next document proves
-		// traversal stops once the legacy window is already complete.
-		countCtx := testutil.NewErrAfterContext(9)
+		// The budget covers the first two documents and their line counts.
+		// Expiring before the next document proves traversal stops once the
+		// legacy window is already complete.
+		countCtx := testutil.NewErrAfterContext(11)
 		result, counts, err := searcher.SearchWithExactCount(context.Background(), countCtx, q, opts)
 		if err != nil {
 			t.Fatal(err)
@@ -288,7 +288,50 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 		if got := result.Stats.FilesConsidered; got != 2 {
 			t.Fatalf("files considered = %d, want immediate stop at bounded window", got)
 		}
+		if got := result.Stats.FilesSkipped; got != 8 {
+			t.Fatalf("files skipped = %d, want remaining 8 documents", got)
+		}
 	})
+
+	t.Run("while matching after display window", func(t *testing.T) {
+		countCtx := testutil.NewErrAfterContext(12)
+		result, counts, err := searcher.SearchWithExactCount(context.Background(), countCtx, q, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if counts != nil {
+			t.Fatalf("counts = %#v, want unavailable", counts)
+		}
+		if diff := cmp.Diff(legacy.Files, result.Files); diff != "" {
+			t.Fatalf("bounded fallback changed (-legacy +counted):\n%s", diff)
+		}
+		if got := result.Stats.FilesConsidered; got != 3 {
+			t.Fatalf("files considered = %d, want stop during the next match", got)
+		}
+		if got := result.Stats.FilesSkipped; got != 8 {
+			t.Fatalf("files skipped = %d, want current and remaining 8 documents", got)
+		}
+	})
+}
+
+func TestSearchShardLimitPreservesFilesSkipped(t *testing.T) {
+	searcher := exactCountSearcherForTest(t,
+		Document{Name: "first.go", Content: []byte("needle\n")},
+		Document{Name: "second.go", Content: []byte("needle\n")},
+		Document{Name: "third.go", Content: []byte("needle\n")},
+	)
+
+	result, err := searcher.Search(
+		context.Background(),
+		&query.Substring{Pattern: "needle"},
+		&zoekt.SearchOptions{ShardMaxMatchCount: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Stats.FilesSkipped; got != 2 {
+		t.Fatalf("files skipped = %d, want remaining 2 documents", got)
+	}
 }
 
 func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
@@ -474,12 +517,14 @@ func TestSearchWithExactCountPreservesNovelExtensionBoost(t *testing.T) {
 		Document{Name: "second.go", Content: []byte("needle\n")},
 		Document{Name: "third.go", Content: []byte("needle\n")},
 		Document{Name: "novel.cpp", Content: []byte("needle\n")},
-		Document{Name: "fifth.go", Content: []byte("needle\n")},
+		Document{Name: "novel.rs", Content: []byte("needle\n")},
+		Document{Name: "novel.py", Content: []byte("needle\n")},
+		Document{Name: "novel.java", Content: []byte("needle\n")},
 	)
 	q := &query.Substring{Pattern: "needle"}
 	opts := &zoekt.SearchOptions{
-		ShardMaxMatchCount:   5,
-		TotalMaxMatchCount:   5,
+		ShardMaxMatchCount:   7,
+		TotalMaxMatchCount:   7,
 		MaxDocDisplayCount:   3,
 		MaxMatchDisplayCount: 3,
 	}
@@ -492,8 +537,8 @@ func TestSearchWithExactCountPreservesNovelExtensionBoost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts == nil || counts.FileCount != 5 {
-		t.Fatalf("counts = %#v, want five files", counts)
+	if counts == nil || counts.FileCount != 7 {
+		t.Fatalf("counts = %#v, want seven files", counts)
 	}
 	if diff := cmp.Diff(legacy.Files, counted.Files); diff != "" {
 		t.Fatalf("novel-extension bounded result changed (-legacy +counted):\n%s", diff)

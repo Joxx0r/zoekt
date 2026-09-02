@@ -171,23 +171,22 @@ func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	}
 }
 
-func TestShardSearchModeUsesExplicitTraversalStates(t *testing.T) {
+func TestShardSearchModeTracksCountingAndResultRetention(t *testing.T) {
 	mode := newExactShardSearchMode(context.Background())
-	if mode.state != shardTraversalExactAndLegacy {
-		t.Fatalf("initial state = %v, want exact-and-legacy", mode.state)
+	if !mode.countingActive || !mode.retainResults {
+		t.Fatalf("initial mode = %#v, want counting and retained results", mode)
 	}
-	if state := mode.stopLegacyResults(); state != shardTraversalExactOnly {
-		t.Fatalf("state after legacy limit = %v, want exact-only", state)
-	}
+	mode.stopLegacyResults()
 	if mode.retainNextResult() {
-		t.Fatal("exact-only traversal retained the next legacy result")
+		t.Fatal("count-only traversal retained the next legacy result")
 	}
-	if state := mode.stopLegacyResults(); state != shardTraversalExactOnly {
-		t.Fatalf("repeated legacy limit changed state to %v, want exact-only", state)
+	if mode.shouldStopAfterResult() {
+		t.Fatal("active exact counting stopped with the legacy result window")
 	}
+	mode.stopLegacyResults()
 	mode.observeCounts(nil)
-	if mode.state != shardTraversalDone || !mode.shouldStopAfterResult() {
-		t.Fatalf("state after unavailable exact count = %v, want done", mode.state)
+	if mode.countingActive || mode.retainResults || !mode.shouldStopAfterResult() {
+		t.Fatalf("mode after unavailable exact count = %#v, want done", mode)
 	}
 	if counts := mode.exactCounts(); counts != nil {
 		t.Fatalf("counts = %#v, want unavailable in done state", counts)

@@ -708,34 +708,22 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 // after its display limit; an exact mode may keep scheduling them as
 // count-only work while its independent count context remains valid.
 type shardSearchMode struct {
-	countCtx context.Context
-	counts   zoekt.ExactSearchCounts
-	state    shardTraversalState
+	countCtx       context.Context
+	counts         zoekt.ExactSearchCounts
+	countingActive bool
+	retainResults  bool
 }
 
-type shardTraversalState uint8
-
-const (
-	shardTraversalLegacy shardTraversalState = iota
-	shardTraversalExactAndLegacy
-	shardTraversalLegacyFallback
-	shardTraversalExactOnly
-	shardTraversalDone
-)
-
 func newLegacyShardSearchMode() *shardSearchMode {
-	return &shardSearchMode{}
+	return &shardSearchMode{retainResults: true}
 }
 
 func newExactShardSearchMode(countCtx context.Context) *shardSearchMode {
-	mode := &shardSearchMode{
-		countCtx: countCtx,
-		state:    shardTraversalExactAndLegacy,
+	return &shardSearchMode{
+		countCtx:       countCtx,
+		countingActive: countCtx.Err() == nil,
+		retainResults:  true,
 	}
-	if countCtx.Err() != nil {
-		mode.state = shardTraversalLegacyFallback
-	}
-	return mode
 }
 
 func (m *shardSearchMode) exactRequested() bool {
@@ -751,60 +739,41 @@ func (m *shardSearchMode) search(ctx context.Context, s zoekt.Searcher, q query.
 }
 
 func (m *shardSearchMode) observeCounts(counts *zoekt.ExactSearchCounts) {
-	if !m.exactRequested() {
+	if !m.countingActive {
 		return
 	}
 	if counts == nil {
-		m.invalidateCounts()
+		m.countingActive = false
 		return
 	}
-	switch m.state {
-	case shardTraversalExactAndLegacy, shardTraversalExactOnly:
-		m.counts.MatchCount += counts.MatchCount
-		m.counts.FileCount += counts.FileCount
-	}
+	m.counts.MatchCount += counts.MatchCount
+	m.counts.FileCount += counts.FileCount
 }
 
-func (m *shardSearchMode) stopLegacyResults() shardTraversalState {
-	switch m.state {
-	case shardTraversalExactAndLegacy:
-		m.state = shardTraversalExactOnly
-	case shardTraversalExactOnly, shardTraversalDone:
-		// Repeated limit observations from already-dispatched shards do not
-		// change the active exact-count traversal state.
-	default:
-		m.state = shardTraversalDone
-	}
-	return m.state
+func (m *shardSearchMode) stopLegacyResults() {
+	m.retainResults = false
 }
 
 func (m *shardSearchMode) retainNextResult() bool {
-	return m.state != shardTraversalExactOnly && m.state != shardTraversalDone
+	return m.retainResults
 }
 
 func (m *shardSearchMode) shouldStopAfterResult() bool {
-	return m.state == shardTraversalDone
+	return !m.countingActive && !m.retainResults
 }
 
 func (m *shardSearchMode) invalidateCounts() {
-	switch m.state {
-	case shardTraversalExactAndLegacy:
-		m.state = shardTraversalLegacyFallback
-	case shardTraversalExactOnly:
-		m.state = shardTraversalDone
-	}
+	m.countingActive = false
 }
 
 func (m *shardSearchMode) exactCounts() *zoekt.ExactSearchCounts {
 	if m.exactRequested() && m.countCtx.Err() != nil {
 		m.invalidateCounts()
 	}
-	switch m.state {
-	case shardTraversalExactAndLegacy, shardTraversalExactOnly:
+	if m.countingActive {
 		return &m.counts
-	default:
-		return nil
 	}
+	return nil
 }
 
 func validateExactCountOptions(opts *zoekt.SearchOptions) error {
@@ -871,13 +840,13 @@ func (c *shardSearchCoordinator) stop() {
 }
 
 func (c *shardSearchCoordinator) stopLegacy() {
-	switch c.mode.stopLegacyResults() {
-	case shardTraversalDone:
+	c.mode.stopLegacyResults()
+	if c.mode.shouldStopAfterResult() {
 		c.stop()
-	case shardTraversalExactOnly:
-		if c.next != nil {
-			c.next.retainResults = false
-		}
+		return
+	}
+	if c.next != nil {
+		c.next.retainResults = false
 	}
 }
 
