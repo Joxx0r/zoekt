@@ -140,6 +140,8 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOpt
 	return sr, err
 }
 
+// SearchWithExactCount implements zoekt.CountedSearcher with an independent
+// context for the complete corpus-wide count traversal.
 func (d *indexData) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	if countCtx == nil {
 		countCtx = context.Background()

@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/sourcegraph/zoekt"
+	"github.com/sourcegraph/zoekt/internal/testutil"
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -241,7 +242,7 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 		// The initial check plus four checks per document cover the first two
 		// documents and their line counts. Expiring on the next document proves
 		// traversal stops once the legacy window is already complete.
-		countCtx := newErrAfterContext(9)
+		countCtx := testutil.NewErrAfterContext(9)
 		result, counts, err := searcher.SearchWithExactCount(context.Background(), countCtx, q, opts)
 		if err != nil {
 			t.Fatal(err)
@@ -259,7 +260,7 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 }
 
 func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
-	countCtx := newErrAfterContext(1)
+	countCtx := testutil.NewErrAfterContext(1)
 	mode, err := newIndexSearchMode(countCtx, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +284,7 @@ func TestIndexSearchModeRechecksRequestBeforePublishingResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestCtx := newErrAfterContext(0)
+	requestCtx := testutil.NewErrAfterContext(0)
 
 	result, counts, err := mode.finish(requestCtx, &zoekt.SearchResult{}, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
 	if !errors.Is(err, context.DeadlineExceeded) {
@@ -348,7 +349,7 @@ func TestSearchWithExactCountRequestCancellationAborts(t *testing.T) {
 			docs[i] = Document{Name: fmt.Sprintf("file-%03d.go", i), Content: []byte("needle\n")}
 		}
 		searcher := exactCountSearcherForTest(t, docs...)
-		requestCtx := newErrAfterContext(3)
+		requestCtx := testutil.NewErrAfterContext(3)
 		result, counts, err := searcher.SearchWithExactCount(
 			requestCtx,
 			context.Background(),
@@ -464,38 +465,6 @@ func TestSearchWithExactCountPreservesNovelExtensionBoost(t *testing.T) {
 	}
 	if diff := cmp.Diff(legacy.Files, counted.Files); diff != "" {
 		t.Fatalf("novel-extension bounded result changed (-legacy +counted):\n%s", diff)
-	}
-}
-
-type errAfterContext struct {
-	context.Context
-	allowed int
-	calls   int
-	done    chan struct{}
-	err     error
-}
-
-func (c *errAfterContext) Err() error {
-	if c.err != nil {
-		return c.err
-	}
-	c.calls++
-	if c.calls > c.allowed {
-		c.err = context.DeadlineExceeded
-		close(c.done)
-	}
-	return c.err
-}
-
-func (c *errAfterContext) Done() <-chan struct{} {
-	return c.done
-}
-
-func newErrAfterContext(allowed int) *errAfterContext {
-	return &errAfterContext{
-		Context: context.Background(),
-		allowed: allowed,
-		done:    make(chan struct{}),
 	}
 }
 

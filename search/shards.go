@@ -266,6 +266,8 @@ type directorySearcher struct {
 	directoryWatcher *DirectoryWatcher
 }
 
+// SearchWithExactCount forwards the zoekt.CountedSearcher contract while the
+// directory watcher owns the underlying streamer's lifecycle.
 func (s *directorySearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
 	counted, ok := s.Streamer.(zoekt.CountedSearcher)
 	if !ok {
@@ -541,6 +543,8 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	return sr, err
 }
 
+// SearchWithExactCount implements zoekt.CountedSearcher across all selected
+// shards while retaining only the bounded legacy result window.
 func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	if err := validateExactCountOptions(opts); err != nil {
 		return nil, nil, err

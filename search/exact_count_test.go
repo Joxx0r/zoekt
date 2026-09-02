@@ -12,6 +12,7 @@ import (
 
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/index"
+	"github.com/sourcegraph/zoekt/internal/testutil"
 	"github.com/sourcegraph/zoekt/query"
 )
 
@@ -161,7 +162,7 @@ func TestNewShardSearchCoordinatorHandlesNoShards(t *testing.T) {
 }
 
 func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
-	countCtx := newErrAfterContext(1)
+	countCtx := testutil.NewErrAfterContext(1)
 	mode := newExactShardSearchMode(countCtx)
 	mode.counts = zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}
 
@@ -280,37 +281,5 @@ func TestDirectorySearcherExposesExactCountContract(t *testing.T) {
 	}
 	if len(result.Files) != 1 || counts == nil || counts.MatchCount != 2 || counts.FileCount != 1 {
 		t.Fatalf("result/counts = %#v/%#v, want two exact lines in one file", result.Files, counts)
-	}
-}
-
-type errAfterContext struct {
-	context.Context
-	allowed int
-	calls   int
-	done    chan struct{}
-	err     error
-}
-
-func (c *errAfterContext) Err() error {
-	if c.err != nil {
-		return c.err
-	}
-	c.calls++
-	if c.calls > c.allowed {
-		c.err = context.DeadlineExceeded
-		close(c.done)
-	}
-	return c.err
-}
-
-func (c *errAfterContext) Done() <-chan struct{} {
-	return c.done
-}
-
-func newErrAfterContext(allowed int) *errAfterContext {
-	return &errAfterContext{
-		Context: context.Background(),
-		allowed: allowed,
-		done:    make(chan struct{}),
 	}
 }

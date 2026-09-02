@@ -17,32 +17,25 @@ type typeRepoSearcher struct {
 }
 
 func (s *typeRepoSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
-	tr, ctx := trace.New(ctx, "typeRepoSearcher.Search", "")
-	tr.LazyLog(q, true)
-	tr.LazyPrintf("opts: %+v", opts)
-	tenant.Log(ctx, tr)
-	defer func() {
-		if sr != nil {
-			tr.LazyPrintf("num files: %d", len(sr.Files))
-			tr.LazyPrintf("stats: %+v", sr.Stats)
-		}
-		if err != nil {
-			tr.LazyPrintf("error: %v", err)
-			tr.SetError(err)
-		}
-		tr.Finish()
-	}()
-
-	q, err = s.eval(ctx, tr, q)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.Streamer.Search(ctx, q, opts)
+	sr, _, err = s.search(ctx, nil, q, opts)
+	return sr, err
 }
 
+// SearchWithExactCount implements zoekt.CountedSearcher after evaluating
+// cross-shard type:repo expressions.
 func (s *typeRepoSearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
-	tr, ctx := trace.New(ctx, "typeRepoSearcher.SearchWithExactCount", "")
+	if countCtx == nil {
+		countCtx = context.Background()
+	}
+	return s.search(ctx, countCtx, q, opts)
+}
+
+func (s *typeRepoSearcher) search(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	traceName := "typeRepoSearcher.Search"
+	if countCtx != nil {
+		traceName = "typeRepoSearcher.SearchWithExactCount"
+	}
+	tr, ctx := trace.New(ctx, traceName, "")
 	tr.LazyLog(q, true)
 	tr.LazyPrintf("opts: %+v", opts)
 	tenant.Log(ctx, tr)
@@ -63,6 +56,10 @@ func (s *typeRepoSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 		return nil, nil, err
 	}
 
+	if countCtx == nil {
+		result, searchErr := s.Streamer.Search(ctx, q, opts)
+		return result, nil, searchErr
+	}
 	counted, ok := s.Streamer.(zoekt.CountedSearcher)
 	if !ok {
 		return nil, nil, zoekt.ErrExactCountUnsupported
