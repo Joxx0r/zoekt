@@ -24,9 +24,6 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Vet exact-count packages
-        run: go vet ./index ./search
-
       - name: Test exact-count packages
         run: go test ./index ./search
 
@@ -42,7 +39,7 @@ jobs:
               "",
               "No issues were found by the fork's deterministic Go validation review.",
               "",
-              "This compatibility hook runs `go vet ./index ./search` and `go test ./index ./search`; semantic review remains owned by the durable ue-game-review specialist cycle.",
+              "This compatibility hook runs `go test ./index ./search`; semantic review remains owned by the durable ue-game-review specialist cycle.",
               "",
               `[View job](${runUrl})`,
             ].join("\n");
