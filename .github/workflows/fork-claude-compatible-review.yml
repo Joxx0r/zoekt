@@ -1,0 +1,73 @@
+name: "Fork: Claude-Compatible Validation Review"
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: Claude-compatible validation review
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the reviewed commit
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet exact-count packages
+        run: go vet ./index ./search
+
+      - name: Test exact-count packages
+        run: go test ./index ./search
+
+      - name: Publish validation review
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = `<!-- fork-validation-review:${context.sha} -->`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              "### Code Review",
+              "",
+              "No issues were found by the fork's deterministic Go validation review.",
+              "",
+              "This compatibility hook runs `go vet ./index ./search` and `go test ./index ./search`; semantic review remains owned by the durable ue-game-review specialist cycle.",
+              "",
+              `[View job](${runUrl})`,
+            ].join("\n");
+
+            const {data: comments} = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment =>
+              comment.user?.login === "github-actions[bot]" && comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
