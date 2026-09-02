@@ -250,7 +250,9 @@ func TestDirectorySearcherExposesExactCountContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := builder.Write(shard); err != nil {
-		shard.Close()
+		if closeErr := shard.Close(); closeErr != nil {
+			t.Logf("close shard after write error: %v", closeErr)
+		}
 		t.Fatal(err)
 	}
 	if err := shard.Close(); err != nil {

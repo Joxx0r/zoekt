@@ -24,6 +24,7 @@ type errAfterContext struct {
 	err     error
 }
 
+// Err counts this check and reports DeadlineExceeded after the configured allowance.
 func (c *errAfterContext) Err() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -39,6 +40,7 @@ func (c *errAfterContext) Err() error {
 	return c.err
 }
 
+// Done closes when Err first exceeds the configured successful-check count.
 func (c *errAfterContext) Done() <-chan struct{} {
 	return c.done
 }

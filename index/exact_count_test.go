@@ -473,6 +473,27 @@ func TestSearchWithExactCountRequiresBoundedResults(t *testing.T) {
 	}
 }
 
+func TestSearchWithExactCountAppliesDefaultBound(t *testing.T) {
+	searcher := exactCountSearcherForTest(t,
+		Document{Name: "a.go", Content: []byte("needle\n")},
+	)
+	result, counts, err := searcher.SearchWithExactCount(
+		context.Background(),
+		context.Background(),
+		&query.Substring{Pattern: "needle"},
+		&zoekt.SearchOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("result files = %d, want 1", len(result.Files))
+	}
+	if diff := cmp.Diff(&zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}, counts); diff != "" {
+		t.Fatalf("exact counts mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestSearchWithExactCountResultMemoryIsDisplayBounded(t *testing.T) {
 	search := func(size int) (*zoekt.SearchResult, *zoekt.ExactSearchCounts) {
 		t.Helper()
