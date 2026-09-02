@@ -617,10 +617,7 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 	}
 
 	collectSender := newCollectSender(opts)
-	countState := exactCountState{
-		ctx:      countCtx,
-		complete: countCtx.Err() == nil,
-	}
+	mode := newExactShardSearchMode(countCtx)
 
 	start := time.Now()
 	proc, err := ss.sched.Acquire(ctx)
@@ -634,7 +631,7 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 	start = time.Now()
 
 	loaded := ss.getLoaded()
-	done, err := streamSearchInternal(ctx, proc, q, opts, loaded.shards, collectSender, &countState)
+	done, err := streamSearchInternal(ctx, proc, q, opts, loaded.shards, collectSender, mode)
 	defer done()
 	if err != nil {
 		return nil, nil, err
@@ -652,14 +649,12 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 
 	if !loaded.ready {
 		aggregate.Stats.Crashes++
-		countState.complete = false
+		mode.invalidateCounts()
 	}
 
 	aggregate.Stats.Wait = wait
 	aggregate.Stats.Duration = time.Since(start)
-	if countState.complete {
-		counts = &countState.counts
-	}
+	counts = mode.exactCounts()
 
 	return aggregate, counts, nil
 }
@@ -735,10 +730,76 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 	return err
 }
 
-type exactCountState struct {
-	ctx      context.Context
-	counts   zoekt.ExactSearchCounts
-	complete bool
+// shardSearchMode centralizes the policy differences between a bounded legacy
+// search and an exact-count traversal. A legacy mode never schedules shards
+// after its display limit; an exact mode may keep scheduling them as
+// count-only work while its independent count context remains valid.
+type shardSearchMode struct {
+	countCtx      context.Context
+	counts        zoekt.ExactSearchCounts
+	countComplete bool
+	legacyStopped bool
+}
+
+func newLegacyShardSearchMode() *shardSearchMode {
+	return &shardSearchMode{}
+}
+
+func newExactShardSearchMode(countCtx context.Context) *shardSearchMode {
+	return &shardSearchMode{
+		countCtx:      countCtx,
+		countComplete: countCtx.Err() == nil,
+	}
+}
+
+func (m *shardSearchMode) exactRequested() bool {
+	return m.countCtx != nil
+}
+
+func (m *shardSearchMode) search(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+	if !m.exactRequested() {
+		result, err := searchOneShard(ctx, s, q, opts)
+		return result, nil, err
+	}
+	return searchOneShardWithExactCount(ctx, m.countCtx, s, q, opts)
+}
+
+func (m *shardSearchMode) observeCounts(counts *zoekt.ExactSearchCounts) {
+	if !m.exactRequested() {
+		return
+	}
+	if counts == nil {
+		m.countComplete = false
+		return
+	}
+	if m.countComplete {
+		m.counts.MatchCount += counts.MatchCount
+		m.counts.FileCount += counts.FileCount
+	}
+}
+
+func (m *shardSearchMode) stopLegacyResults() bool {
+	m.legacyStopped = true
+	return !m.countComplete
+}
+
+func (m *shardSearchMode) retainNextResult() bool {
+	return !m.legacyStopped
+}
+
+func (m *shardSearchMode) shouldStopAfterResult() bool {
+	return m.legacyStopped && !m.countComplete
+}
+
+func (m *shardSearchMode) invalidateCounts() {
+	m.countComplete = false
+}
+
+func (m *shardSearchMode) exactCounts() *zoekt.ExactSearchCounts {
+	if !m.exactRequested() || !m.countComplete {
+		return nil
+	}
+	return &m.counts
 }
 
 // streamSearch is an internal helper since both Search and StreamSearch are
@@ -750,10 +811,10 @@ type exactCountState struct {
 // to collect those shards. The caller must call copyFiles on any
 // SearchResults it returns/streams out before calling done.
 func streamSearch(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender) (done func(), err error) {
-	return streamSearchInternal(ctx, proc, q, opts, shards, sender, nil)
+	return streamSearchInternal(ctx, proc, q, opts, shards, sender, newLegacyShardSearchMode())
 }
 
-func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender, exact *exactCountState) (done func(), err error) {
+func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *zoekt.SearchOptions, shards []*rankedShard, sender zoekt.Sender, mode *shardSearchMode) (done func(), err error) {
 	tr, ctx := trace.New(ctx, "shardedSearcher.streamSearch", "")
 	overallStart := time.Now()
 	metricSearchRunning.Inc()
@@ -825,16 +886,7 @@ func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *z
 		go func() {
 			defer wg.Done()
 			for work := range search {
-				var (
-					sr     *zoekt.SearchResult
-					counts *zoekt.ExactSearchCounts
-					err    error
-				)
-				if exact == nil {
-					sr, err = searchOneShard(ctx, work.shard, q, opts)
-				} else {
-					sr, counts, err = searchOneShardWithExactCount(ctx, exact.ctx, work.shard.Searcher, q, opts)
-				}
+				sr, counts, err := mode.search(ctx, work.shard.Searcher, q, opts)
 				r := &result{
 					priority:      work.shard.priority,
 					retainResults: work.retainResults,
@@ -857,8 +909,6 @@ func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *z
 		shard   = 0
 		next    = &shardWork{shard: shards[shard], retainResults: true}
 
-		legacyStopped = false
-
 		// We need a separate nil-able reference to the same channel so we can close(search) for the worker
 		// go-routines to finish but also set work to nil in order for the select statement below to ignore
 		// that case when we want to stop a search. This is needed because sending on a closed channel panics.
@@ -873,8 +923,7 @@ func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *z
 		}
 	}
 	stopLegacy := func() {
-		legacyStopped = true
-		if exact == nil || !exact.complete {
+		if mode.stopLegacyResults() {
 			stop()
 		} else if next != nil {
 			next.retainResults = false
@@ -900,7 +949,7 @@ search:
 			if shard == len(shards) {
 				stop()
 			} else {
-				next = &shardWork{shard: shards[shard], retainResults: !legacyStopped}
+				next = &shardWork{shard: shards[shard], retainResults: mode.retainNextResult()}
 			}
 		case r, ok := <-results: // is there a result to send back?
 			if !ok {
@@ -921,14 +970,7 @@ search:
 				err = r.err
 				continue
 			}
-			if exact != nil {
-				if r.exactCounts == nil {
-					exact.complete = false
-				} else if exact.complete {
-					exact.counts.MatchCount += r.exactCounts.MatchCount
-					exact.counts.FileCount += r.exactCounts.FileCount
-				}
-			}
+			mode.observeCounts(r.exactCounts)
 
 			// Update the match count statistics and stop searching new shards if we've
 			// reached the limit set in the options.
@@ -947,7 +989,7 @@ search:
 
 				sendByRepository(r.SearchResult, opts, sender) // send the result back to the client
 			}
-			if exact != nil && !exact.complete && legacyStopped {
+			if mode.shouldStopAfterResult() {
 				stop()
 			}
 		}

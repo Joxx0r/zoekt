@@ -15,6 +15,106 @@ type retainedFileMatch struct {
 	match    zoekt.FileMatch
 }
 
+// indexSearchMode keeps the legacy result-window and optional exact-count
+// policies out of the document traversal. Legacy Search uses the zero-value
+// counting fields; SearchWithExactCount installs a separate count context and
+// a bounded result collector.
+type indexSearchMode struct {
+	countCtx      context.Context
+	countComplete bool
+	counts        zoekt.ExactSearchCounts
+	collector     *boundedFileCollector
+	legacyDone    bool
+}
+
+func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
+	mode := &indexSearchMode{countCtx: countCtx}
+	if countCtx == nil {
+		return mode, nil
+	}
+	if opts.MaxDocDisplayCount <= 0 && opts.MaxMatchDisplayCount <= 0 && opts.ShardMaxMatchCount <= 0 {
+		return nil, zoekt.ErrExactCountRequiresBoundedResults
+	}
+	mode.countComplete = countCtx.Err() == nil
+	mode.collector = newBoundedFileCollector(opts)
+	return mode, nil
+}
+
+func (m *indexSearchMode) exactRequested() bool {
+	return m.countCtx != nil
+}
+
+func (m *indexSearchMode) refreshCountBudget() {
+	if m.countComplete && m.countCtx.Err() != nil {
+		m.countComplete = false
+	}
+}
+
+func (m *indexSearchMode) requestState(ctx context.Context) (canceled bool, err error) {
+	err = ctx.Err()
+	if err != nil && m.exactRequested() {
+		return false, err
+	}
+	return err != nil, nil
+}
+
+func (m *indexSearchMode) shouldStop() bool {
+	return m.legacyDone && !m.countComplete
+}
+
+func (m *indexSearchMode) shouldSkipRepoLimited(repoLimited bool) bool {
+	return repoLimited && !m.countComplete
+}
+
+func (m *indexSearchMode) shouldCollectLegacy(repoLimited bool) bool {
+	return !m.legacyDone && !repoLimited
+}
+
+func (m *indexSearchMode) countDocument(ctx context.Context, cp *contentProvider, matches []*candidateMatch) error {
+	if !m.countComplete {
+		return nil
+	}
+	lineCount, complete, err := countSourceLines(ctx, m.countCtx, cp, matches)
+	if err != nil {
+		return err
+	}
+	if !complete {
+		m.countComplete = false
+		return nil
+	}
+	m.counts.MatchCount += lineCount
+	m.counts.FileCount++
+	return nil
+}
+
+func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt.FileMatch, opts *zoekt.SearchOptions) {
+	if m.collector != nil {
+		m.collector.Add(file)
+	} else {
+		result.Files = append(result.Files, file)
+	}
+
+	matchedChunkRanges := 0
+	for _, chunk := range file.ChunkMatches {
+		matchedChunkRanges += len(chunk.Ranges)
+	}
+	result.Stats.MatchCount += len(file.LineMatches) + matchedChunkRanges
+	result.Stats.FileCount++
+	if opts.ShardMaxMatchCount > 0 && result.Stats.MatchCount >= opts.ShardMaxMatchCount {
+		m.legacyDone = true
+	}
+}
+
+func (m *indexSearchMode) finish(result *zoekt.SearchResult, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+	if m.collector != nil {
+		result.Files = m.collector.Files(opts)
+	}
+	if m.countComplete {
+		return result, &m.counts, nil
+	}
+	return result, nil, nil
+}
+
 // boundedFileCollector retains enough score leaders to reproduce SortFiles'
 // bounded output, including its third-result novel-extension promotion. The
 // number of retained files is bounded by the requested display window plus
@@ -151,7 +251,9 @@ func countSourceLines(ctx, countCtx context.Context, cp *contentProvider, matche
 		}
 		start := match.byteOffset
 		end := match.byteOffset + match.byteMatchSz
-		segmentStart := start
+		// Every content candidate owns its starting source line, including
+		// zero-width matches and candidates that consist only of a newline.
+		addLine(start)
 		for offset := start; offset < end; offset++ {
 			if checks%exactCountContextCheckInterval == 0 {
 				if err := ctx.Err(); err != nil {
@@ -165,13 +267,9 @@ func countSourceLines(ctx, countCtx context.Context, cp *contentProvider, matche
 			if data[offset] != '\n' {
 				continue
 			}
-			if segmentStart < offset {
-				addLine(segmentStart)
+			if offset+1 < end {
+				addLine(offset + 1)
 			}
-			segmentStart = offset + 1
-		}
-		if segmentStart < end {
-			addLine(segmentStart)
 		}
 	}
 	return lineCount, true, nil

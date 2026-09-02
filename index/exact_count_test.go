@@ -112,6 +112,55 @@ func TestSearchWithExactCountZeroAndFilenameRows(t *testing.T) {
 	}
 }
 
+func TestCountSourceLinesIncludesZeroWidthAndNewlineOnlyMatches(t *testing.T) {
+	builder := testShardBuilder(t, nil,
+		Document{Name: "a.go", Content: []byte("first\nsecond\n")},
+	)
+	searcher := searcherForTest(t, builder)
+	d, ok := searcher.(*indexData)
+	if !ok {
+		t.Fatalf("searcher type = %T, want *indexData", searcher)
+	}
+	cp := &contentProvider{id: d, stats: &zoekt.Stats{}}
+	cp.setDocument(0)
+
+	tests := []struct {
+		name    string
+		matches []*candidateMatch
+		want    int
+	}{
+		{
+			name:    "zero width",
+			matches: []*candidateMatch{{byteOffset: 0}},
+			want:    1,
+		},
+		{
+			name:    "newline only",
+			matches: []*candidateMatch{{byteOffset: 5, byteMatchSz: 1}},
+			want:    1,
+		},
+		{
+			name:    "newline and following text",
+			matches: []*candidateMatch{{byteOffset: 5, byteMatchSz: 7}},
+			want:    2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, complete, err := countSourceLines(context.Background(), context.Background(), cp, test.matches)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !complete {
+				t.Fatal("count unexpectedly incomplete")
+			}
+			if got != test.want {
+				t.Fatalf("source line count = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 	docs := make([]Document, 10)
 	for i := range docs {
