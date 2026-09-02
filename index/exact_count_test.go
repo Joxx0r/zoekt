@@ -150,7 +150,7 @@ func TestSearchWithExactCountBudgetExpiryPreservesBoundedResult(t *testing.T) {
 		// The initial check plus four checks per document cover the first two
 		// documents and their line counts. Expiring on the next document proves
 		// traversal stops once the legacy window is already complete.
-		countCtx := &errAfterContext{Context: context.Background(), allowed: 9}
+		countCtx := newErrAfterContext(9)
 		result, counts, err := searcher.SearchWithExactCount(context.Background(), countCtx, q, opts)
 		if err != nil {
 			t.Fatal(err)
@@ -188,7 +188,7 @@ func TestSearchWithExactCountRequestCancellationAborts(t *testing.T) {
 			docs[i] = Document{Name: fmt.Sprintf("file-%03d.go", i), Content: []byte("needle\n")}
 		}
 		searcher := exactCountSearcherForTest(t, docs...)
-		requestCtx := &errAfterContext{Context: context.Background(), allowed: 3}
+		requestCtx := newErrAfterContext(3)
 		result, counts, err := searcher.SearchWithExactCount(
 			requestCtx,
 			context.Background(),
@@ -293,14 +293,32 @@ type errAfterContext struct {
 	context.Context
 	allowed int
 	calls   int
+	done    chan struct{}
+	err     error
 }
 
 func (c *errAfterContext) Err() error {
+	if c.err != nil {
+		return c.err
+	}
 	c.calls++
 	if c.calls > c.allowed {
-		return context.DeadlineExceeded
+		c.err = context.DeadlineExceeded
+		close(c.done)
 	}
-	return nil
+	return c.err
+}
+
+func (c *errAfterContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func newErrAfterContext(allowed int) *errAfterContext {
+	return &errAfterContext{
+		Context: context.Background(),
+		allowed: allowed,
+		done:    make(chan struct{}),
+	}
 }
 
 func exactCountSearcherForTest(t testing.TB, docs ...Document) zoekt.CountedSearcher {
