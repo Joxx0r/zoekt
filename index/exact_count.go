@@ -27,12 +27,14 @@ type indexSearchMode struct {
 	legacyDone    bool
 }
 
-type indexTraversalDecision struct {
-	canceled bool
-	stop     bool
-	skip     bool
-	collect  bool
-}
+type indexTraversalAction uint8
+
+const (
+	indexTraversalContinue indexTraversalAction = iota
+	indexTraversalCanceled
+	indexTraversalStop
+	indexTraversalCollect
+)
 
 func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
 	mode := &indexSearchMode{countCtx: countCtx}
@@ -77,39 +79,39 @@ func (m *indexSearchMode) shouldCollectLegacy(repoLimited bool) bool {
 	return !m.legacyDone && !repoLimited
 }
 
-func (m *indexSearchMode) beforeDocument(ctx context.Context, repoLimited bool) (indexTraversalDecision, error) {
+func (m *indexSearchMode) beforeDocument(ctx context.Context) (indexTraversalAction, error) {
 	canceled, err := m.requestState(ctx)
 	if err != nil {
-		return indexTraversalDecision{}, err
+		return indexTraversalContinue, err
 	}
 	if canceled {
-		return indexTraversalDecision{canceled: true}, nil
+		return indexTraversalCanceled, nil
 	}
 	m.refreshCountBudget()
 	if m.shouldStop() {
-		return indexTraversalDecision{stop: true}, nil
+		return indexTraversalStop, nil
 	}
-	if m.shouldSkipRepoLimited(repoLimited) {
-		return indexTraversalDecision{skip: true}, nil
-	}
-	return indexTraversalDecision{}, nil
+	return indexTraversalContinue, nil
 }
 
-func (m *indexSearchMode) afterDocumentMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalDecision, error) {
+func (m *indexSearchMode) afterDocumentMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalAction, error) {
 	if _, err := m.requestState(ctx); err != nil {
-		return indexTraversalDecision{}, err
+		return indexTraversalContinue, err
 	}
 	m.refreshCountBudget()
 	if m.shouldStop() {
-		return indexTraversalDecision{stop: true}, nil
+		return indexTraversalStop, nil
 	}
 	if err := m.countDocument(ctx, cp, matches); err != nil {
-		return indexTraversalDecision{}, err
+		return indexTraversalContinue, err
 	}
 	if !m.shouldCollectLegacy(repoLimited) {
-		return indexTraversalDecision{stop: m.shouldStop()}, nil
+		if m.shouldStop() {
+			return indexTraversalStop, nil
+		}
+		return indexTraversalContinue, nil
 	}
-	return indexTraversalDecision{collect: true}, nil
+	return indexTraversalCollect, nil
 }
 
 func (m *indexSearchMode) countDocument(ctx context.Context, cp *contentProvider, matches []*candidateMatch) error {

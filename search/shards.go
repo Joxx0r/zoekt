@@ -854,17 +854,22 @@ type shardSearchCoordinator struct {
 }
 
 func newShardSearchCoordinator(mode *shardSearchMode, opts *zoekt.SearchOptions, sender zoekt.Sender, shards []*rankedShard, search chan *shardSearchWork, workers int) *shardSearchCoordinator {
-	return &shardSearchCoordinator{
-		mode:      mode,
-		opts:      opts,
-		sender:    sender,
-		shards:    shards,
-		search:    search,
-		work:      search,
-		pending:   make(prioritySlice, 0, workers),
-		nextShard: 1,
-		next:      &shardSearchWork{shard: shards[0], retainResults: true},
+	coordinator := &shardSearchCoordinator{
+		mode:    mode,
+		opts:    opts,
+		sender:  sender,
+		shards:  shards,
+		search:  search,
+		work:    search,
+		pending: make(prioritySlice, 0, workers),
 	}
+	if len(shards) == 0 {
+		coordinator.stop()
+		return coordinator
+	}
+	coordinator.nextShard = 1
+	coordinator.next = &shardSearchWork{shard: shards[0], retainResults: true}
+	return coordinator
 }
 
 func (c *shardSearchCoordinator) stop() {
@@ -1148,23 +1153,24 @@ func copyFiles(sr *zoekt.SearchResult) {
 }
 
 func searchOneShard(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
-	metricSearchShardRunning.Inc()
-	defer func() {
-		metricSearchShardRunning.Dec()
-		if e := recover(); e != nil {
-			log.Printf("[ERROR] crashed shard: %s: %#v, %s", s, e, debug.Stack())
-
-			if sr == nil {
-				sr = &zoekt.SearchResult{}
-			}
-			sr.Stats.Crashes = 1
-		}
-	}()
-
-	return s.Search(ctx, q, opts)
+	sr, _, err = runShardSearch(s, func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+		result, searchErr := s.Search(ctx, q, opts)
+		return result, nil, searchErr
+	})
+	return sr, err
 }
 
 func searchOneShardWithExactCount(ctx, countCtx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	return runShardSearch(s, func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+		counted, ok := s.(zoekt.CountedSearcher)
+		if !ok {
+			return nil, nil, zoekt.ErrExactCountUnsupported
+		}
+		return counted.SearchWithExactCount(ctx, countCtx, q, opts)
+	})
+}
+
+func runShardSearch(s zoekt.Searcher, search func() (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error)) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
 	metricSearchShardRunning.Inc()
 	defer func() {
 		metricSearchShardRunning.Dec()
@@ -1178,12 +1184,7 @@ func searchOneShardWithExactCount(ctx, countCtx context.Context, s zoekt.Searche
 			counts = nil
 		}
 	}()
-
-	counted, ok := s.(zoekt.CountedSearcher)
-	if !ok {
-		return nil, nil, zoekt.ErrExactCountUnsupported
-	}
-	return counted.SearchWithExactCount(ctx, countCtx, q, opts)
+	return search()
 }
 
 type shardListResult struct {

@@ -112,6 +112,30 @@ func TestSearchWithExactCountZeroAndFilenameRows(t *testing.T) {
 	}
 }
 
+func TestSearchWithExactCountIgnoresEstimateOnlyShortcut(t *testing.T) {
+	searcher := exactCountSearcherForTest(t,
+		Document{Name: "a.go", Content: []byte("needle\nneedle\n")},
+	)
+	opts := &zoekt.SearchOptions{
+		EstimateDocCount:     true,
+		MaxDocDisplayCount:   1,
+		MaxMatchDisplayCount: 1,
+	}
+
+	result, counts, err := searcher.SearchWithExactCount(
+		context.Background(), context.Background(), &query.Substring{Pattern: "needle"}, opts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(&zoekt.ExactSearchCounts{MatchCount: 2, FileCount: 1}, counts); diff != "" {
+		t.Fatalf("exact counts mismatch (-want +got):\n%s", diff)
+	}
+	if len(result.Files) != 1 {
+		t.Fatalf("bounded result files = %d, want 1", len(result.Files))
+	}
+}
+
 func TestCountSourceLinesIncludesZeroWidthAndNewlineOnlyMatches(t *testing.T) {
 	builder := testShardBuilder(t, nil,
 		Document{Name: "a.go", Content: []byte("first\nsecond\n")},
@@ -320,6 +344,24 @@ func TestSearchWithExactCountRequestCancellationAborts(t *testing.T) {
 		}
 		if result != nil || counts != nil {
 			t.Fatalf("result/counts = %#v/%#v, want no partial response", result, counts)
+		}
+	})
+
+	t.Run("empty index", func(t *testing.T) {
+		emptySearcher := exactCountSearcherForTest(t)
+		requestCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result, counts, err := emptySearcher.SearchWithExactCount(
+			requestCtx,
+			context.Background(),
+			&query.Substring{Pattern: "needle"},
+			&zoekt.SearchOptions{MaxDocDisplayCount: 1},
+		)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+		if result != nil || counts != nil {
+			t.Fatalf("result/counts = %#v/%#v, want nil on request cancellation", result, counts)
 		}
 	})
 }

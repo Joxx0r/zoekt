@@ -121,6 +121,45 @@ func TestShardedSearchWithExactCountRejectsUnboundedEmptySearch(t *testing.T) {
 	}
 }
 
+func TestShardedSearchWithExactCountReturnsZeroCountsForEmptySearch(t *testing.T) {
+	ss := newShardedSearcher(1)
+	ss.markReady()
+
+	result, counts, err := ss.SearchWithExactCount(
+		context.Background(),
+		context.Background(),
+		&query.Substring{Pattern: "needle"},
+		&zoekt.SearchOptions{MaxDocDisplayCount: 1},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || len(result.Files) != 0 {
+		t.Fatalf("result = %#v, want an empty result", result)
+	}
+	if diff := cmp.Diff(&zoekt.ExactSearchCounts{}, counts); diff != "" {
+		t.Fatalf("exact counts mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestNewShardSearchCoordinatorHandlesNoShards(t *testing.T) {
+	search := make(chan *shardSearchWork)
+	coordinator := newShardSearchCoordinator(
+		newExactShardSearchMode(context.Background()),
+		&zoekt.SearchOptions{MaxDocDisplayCount: 1},
+		zoekt.SenderFunc(func(*zoekt.SearchResult) {}),
+		nil,
+		search,
+		0,
+	)
+	if coordinator.work != nil || coordinator.next != nil {
+		t.Fatalf("empty coordinator remained schedulable: %#v", coordinator)
+	}
+	if _, open := <-search; open {
+		t.Fatal("empty coordinator did not close its worker channel")
+	}
+}
+
 func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	countCtx := newShardErrAfterContext(1)
 	mode := newExactShardSearchMode(countCtx)

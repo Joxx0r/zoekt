@@ -160,6 +160,11 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 	}
 
 	var res zoekt.SearchResult
+	if mode.exactRequested() {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
 	if len(d.fileNameIndex) == 0 {
 		return mode.finish(&res, opts)
 	}
@@ -179,7 +184,7 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 		return mode.finish(&res, opts)
 	}
 
-	if opts.EstimateDocCount {
+	if opts.EstimateDocCount && !mode.exactRequested() {
 		res.Stats.ShardFilesConsidered = len(d.fileBranchMasks)
 		return mode.finish(&res, opts)
 	}
@@ -264,21 +269,16 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
-		decision, err := mode.beforeDocument(ctx, repoLimited)
+		action, err := mode.beforeDocument(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		if decision.canceled {
+		switch action {
+		case indexTraversalCanceled:
 			res.Stats.FilesSkipped += int(docCount - nextDoc)
-			break
-		}
-		if decision.stop {
-			break
-		}
-		if decision.skip {
-			res.Stats.FilesSkipped++
-			lastDoc = int(nextDoc)
-			continue
+			break nextFileMatch
+		case indexTraversalStop:
+			break nextFileMatch
 		}
 
 		lastDoc = int(nextDoc)
@@ -316,14 +316,14 @@ nextFileMatch:
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		decision, err = mode.afterDocumentMatch(ctx, repoLimited, cp, finalCands)
+		action, err = mode.afterDocumentMatch(ctx, repoLimited, cp, finalCands)
 		if err != nil {
 			return nil, nil, err
 		}
-		if decision.stop {
+		if action == indexTraversalStop {
 			break
 		}
-		if !decision.collect {
+		if action != indexTraversalCollect {
 			continue
 		}
 
