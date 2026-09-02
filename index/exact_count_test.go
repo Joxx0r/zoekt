@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -184,6 +182,40 @@ func TestCountSourceLinesIncludesZeroWidthAndNewlineOnlyMatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCountSourceLinesChecksContextsForZeroWidthMatches(t *testing.T) {
+	builder := testShardBuilder(t, nil,
+		Document{Name: "a.go", Content: []byte("first\nsecond\n")},
+	)
+	searcher := searcherForTest(t, builder)
+	d, ok := searcher.(*indexData)
+	if !ok {
+		t.Fatalf("searcher type = %T, want *indexData", searcher)
+	}
+	cp := &contentProvider{id: d, stats: &zoekt.Stats{}}
+	cp.setDocument(0)
+	matches := []*candidateMatch{{byteOffset: 0}}
+
+	t.Run("request cancellation", func(t *testing.T) {
+		got, complete, err := countSourceLines(testutil.NewErrAfterContext(1), context.Background(), cp, matches)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want DeadlineExceeded", err)
+		}
+		if complete || got != 0 {
+			t.Fatalf("count = %d, complete = %t; want 0, false", got, complete)
+		}
+	})
+
+	t.Run("count budget expiry", func(t *testing.T) {
+		got, complete, err := countSourceLines(context.Background(), testutil.NewErrAfterContext(1), cp, matches)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if complete || got != 0 {
+			t.Fatalf("count = %d, complete = %t; want 0, false", got, complete)
+		}
+	})
 }
 
 func TestSearchWithExactCountCountsNewlineOnlySourceLines(t *testing.T) {
@@ -505,15 +537,12 @@ func BenchmarkSearchWithExactCountBroadQuery(b *testing.B) {
 				MaxMatchDisplayCount: 15,
 			}
 			q := &query.Substring{Pattern: "needle"}
-			durations := make([]time.Duration, 0, b.N)
 			var resultBytes uint64
 
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				started := time.Now()
 				result, counts, err := searcher.SearchWithExactCount(context.Background(), context.Background(), q, opts)
-				durations = append(durations, time.Since(started))
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -523,12 +552,6 @@ func BenchmarkSearchWithExactCountBroadQuery(b *testing.B) {
 				resultBytes = result.SizeBytes()
 			}
 			b.StopTimer()
-
-			sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
-			if len(durations) > 0 {
-				b.ReportMetric(float64(durations[len(durations)/2].Nanoseconds()), "p50-ns")
-				b.ReportMetric(float64(durations[(len(durations)-1)*95/100].Nanoseconds()), "p95-ns")
-			}
 			b.ReportMetric(float64(resultBytes), "result-B/op")
 		})
 	}

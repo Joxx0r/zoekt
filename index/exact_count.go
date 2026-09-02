@@ -27,20 +27,20 @@ type indexSearchMode struct {
 	legacyDone    bool
 }
 
-type indexTraversalAction uint8
+type beforeDocumentAction uint8
 
 const (
-	indexTraversalContinue indexTraversalAction = iota
-	indexTraversalCanceled
-	indexTraversalStop
-	indexTraversalCollect
+	beforeDocumentContinue beforeDocumentAction = iota
+	beforeDocumentCanceled
+	beforeDocumentStop
 )
 
-type indexTraversalPoint uint8
+type afterMatchAction uint8
 
 const (
-	indexTraversalBeforeDocument indexTraversalPoint = iota
-	indexTraversalAfterMatch
+	afterMatchContinue afterMatchAction = iota
+	afterMatchStop
+	afterMatchCollect
 )
 
 func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
@@ -64,29 +64,33 @@ func (m *indexSearchMode) shouldSkipRepoLimited(repoLimited bool) bool {
 	return repoLimited && !m.countComplete
 }
 
-func (m *indexSearchMode) advanceTraversal(ctx context.Context, point indexTraversalPoint, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalAction, error) {
+func (m *indexSearchMode) beforeDocument(ctx context.Context) (beforeDocumentAction, error) {
 	if err := ctx.Err(); err != nil {
 		if m.exactRequested() {
-			return indexTraversalContinue, err
+			return beforeDocumentContinue, err
 		}
-		if point == indexTraversalBeforeDocument {
-			return indexTraversalCanceled, nil
-		}
+		return beforeDocumentCanceled, nil
 	}
-	if m.countComplete && m.countCtx.Err() != nil {
-		m.countComplete = false
-	}
+	m.refreshCountBudget()
 	if m.legacyDone && !m.countComplete {
-		return indexTraversalStop, nil
+		return beforeDocumentStop, nil
 	}
-	if point == indexTraversalBeforeDocument {
-		return indexTraversalContinue, nil
+	return beforeDocumentContinue, nil
+}
+
+func (m *indexSearchMode) afterMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (afterMatchAction, error) {
+	if err := ctx.Err(); err != nil && m.exactRequested() {
+		return afterMatchContinue, err
+	}
+	m.refreshCountBudget()
+	if m.legacyDone && !m.countComplete {
+		return afterMatchStop, nil
 	}
 
 	if m.countComplete {
 		lineCount, complete, err := countSourceLines(ctx, m.countCtx, cp, matches)
 		if err != nil {
-			return indexTraversalContinue, err
+			return afterMatchContinue, err
 		}
 		if !complete {
 			m.countComplete = false
@@ -96,12 +100,18 @@ func (m *indexSearchMode) advanceTraversal(ctx context.Context, point indexTrave
 		}
 	}
 	if m.legacyDone && !m.countComplete {
-		return indexTraversalStop, nil
+		return afterMatchStop, nil
 	}
 	if m.legacyDone || repoLimited {
-		return indexTraversalContinue, nil
+		return afterMatchContinue, nil
 	}
-	return indexTraversalCollect, nil
+	return afterMatchCollect, nil
+}
+
+func (m *indexSearchMode) refreshCountBudget() {
+	if m.countComplete && m.countCtx.Err() != nil {
+		m.countComplete = false
+	}
 }
 
 func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt.FileMatch, matchCount int, opts *zoekt.SearchOptions) {
@@ -279,6 +289,12 @@ func countSourceLines(ctx, countCtx context.Context, cp *contentProvider, matche
 	for _, match := range matches {
 		if match.fileName {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+		if countCtx.Err() != nil {
+			return 0, false, nil
 		}
 		start := match.byteOffset
 		end := match.byteOffset + match.byteMatchSz

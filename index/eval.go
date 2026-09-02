@@ -266,15 +266,15 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
-		action, err := mode.advanceTraversal(ctx, indexTraversalBeforeDocument, repoLimited, nil, nil)
+		action, err := mode.beforeDocument(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
 		switch action {
-		case indexTraversalCanceled:
+		case beforeDocumentCanceled:
 			res.Stats.FilesSkipped += int(docCount - nextDoc)
 			break nextFileMatch
-		case indexTraversalStop:
+		case beforeDocumentStop:
 			break nextFileMatch
 		}
 
@@ -313,14 +313,14 @@ nextFileMatch:
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		action, err = mode.advanceTraversal(ctx, indexTraversalAfterMatch, repoLimited, cp, finalCands)
+		postAction, err := mode.afterMatch(ctx, repoLimited, cp, finalCands)
 		if err != nil {
 			return nil, nil, err
 		}
-		if action == indexTraversalStop {
+		if postAction == afterMatchStop {
 			break
 		}
-		if action != indexTraversalCollect {
+		if postAction != afterMatchCollect {
 			continue
 		}
 
