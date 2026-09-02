@@ -103,6 +103,34 @@ func TestShardedSearchWithExactCountBudgetExpiryPreservesResult(t *testing.T) {
 	}
 }
 
+func TestShardedSearchWithExactCountRejectsUnboundedEmptySearch(t *testing.T) {
+	ss := newShardedSearcher(1)
+	ss.markReady()
+
+	result, counts, err := ss.SearchWithExactCount(
+		context.Background(),
+		context.Background(),
+		&query.Substring{Pattern: "needle"},
+		&zoekt.SearchOptions{ShardMaxMatchCount: -1},
+	)
+	if !errors.Is(err, zoekt.ErrExactCountRequiresBoundedResults) {
+		t.Fatalf("error = %v, want ErrExactCountRequiresBoundedResults", err)
+	}
+	if result != nil || counts != nil {
+		t.Fatalf("result/counts = %#v/%#v, want nil for invalid options", result, counts)
+	}
+}
+
+func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
+	countCtx := newShardErrAfterContext(1)
+	mode := newExactShardSearchMode(countCtx)
+	mode.counts = zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}
+
+	if counts := mode.exactCounts(); counts != nil {
+		t.Fatalf("counts = %#v, want unavailable after final budget check", counts)
+	}
+}
+
 func TestShardedSearchWithExactCountRequestCancellation(t *testing.T) {
 	ss := newShardedSearcher(1)
 	ss.replace(map[string]zoekt.Searcher{
@@ -190,5 +218,37 @@ func TestDirectorySearcherExposesExactCountContract(t *testing.T) {
 	}
 	if len(result.Files) != 1 || counts == nil || counts.MatchCount != 2 || counts.FileCount != 1 {
 		t.Fatalf("result/counts = %#v/%#v, want two exact lines in one file", result.Files, counts)
+	}
+}
+
+type shardErrAfterContext struct {
+	context.Context
+	allowed int
+	calls   int
+	done    chan struct{}
+	err     error
+}
+
+func (c *shardErrAfterContext) Err() error {
+	if c.err != nil {
+		return c.err
+	}
+	c.calls++
+	if c.calls > c.allowed {
+		c.err = context.DeadlineExceeded
+		close(c.done)
+	}
+	return c.err
+}
+
+func (c *shardErrAfterContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func newShardErrAfterContext(allowed int) *shardErrAfterContext {
+	return &shardErrAfterContext{
+		Context: context.Background(),
+		allowed: allowed,
+		done:    make(chan struct{}),
 	}
 }

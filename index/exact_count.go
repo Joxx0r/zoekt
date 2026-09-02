@@ -27,6 +27,13 @@ type indexSearchMode struct {
 	legacyDone    bool
 }
 
+type indexTraversalDecision struct {
+	canceled bool
+	stop     bool
+	skip     bool
+	collect  bool
+}
+
 func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
 	mode := &indexSearchMode{countCtx: countCtx}
 	if countCtx == nil {
@@ -70,6 +77,41 @@ func (m *indexSearchMode) shouldCollectLegacy(repoLimited bool) bool {
 	return !m.legacyDone && !repoLimited
 }
 
+func (m *indexSearchMode) beforeDocument(ctx context.Context, repoLimited bool) (indexTraversalDecision, error) {
+	canceled, err := m.requestState(ctx)
+	if err != nil {
+		return indexTraversalDecision{}, err
+	}
+	if canceled {
+		return indexTraversalDecision{canceled: true}, nil
+	}
+	m.refreshCountBudget()
+	if m.shouldStop() {
+		return indexTraversalDecision{stop: true}, nil
+	}
+	if m.shouldSkipRepoLimited(repoLimited) {
+		return indexTraversalDecision{skip: true}, nil
+	}
+	return indexTraversalDecision{}, nil
+}
+
+func (m *indexSearchMode) afterDocumentMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalDecision, error) {
+	if _, err := m.requestState(ctx); err != nil {
+		return indexTraversalDecision{}, err
+	}
+	m.refreshCountBudget()
+	if m.shouldStop() {
+		return indexTraversalDecision{stop: true}, nil
+	}
+	if err := m.countDocument(ctx, cp, matches); err != nil {
+		return indexTraversalDecision{}, err
+	}
+	if !m.shouldCollectLegacy(repoLimited) {
+		return indexTraversalDecision{stop: m.shouldStop()}, nil
+	}
+	return indexTraversalDecision{collect: true}, nil
+}
+
 func (m *indexSearchMode) countDocument(ctx context.Context, cp *contentProvider, matches []*candidateMatch) error {
 	if !m.countComplete {
 		return nil
@@ -87,18 +129,14 @@ func (m *indexSearchMode) countDocument(ctx context.Context, cp *contentProvider
 	return nil
 }
 
-func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt.FileMatch, opts *zoekt.SearchOptions) {
+func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt.FileMatch, matchCount int, opts *zoekt.SearchOptions) {
 	if m.collector != nil {
 		m.collector.Add(file)
 	} else {
 		result.Files = append(result.Files, file)
 	}
 
-	matchedChunkRanges := 0
-	for _, chunk := range file.ChunkMatches {
-		matchedChunkRanges += len(chunk.Ranges)
-	}
-	result.Stats.MatchCount += len(file.LineMatches) + matchedChunkRanges
+	result.Stats.MatchCount += matchCount
 	result.Stats.FileCount++
 	if opts.ShardMaxMatchCount > 0 && result.Stats.MatchCount >= opts.ShardMaxMatchCount {
 		m.legacyDone = true
@@ -142,24 +180,34 @@ func newBoundedFileCollector(opts *zoekt.SearchOptions) *boundedFileCollector {
 }
 
 func (c *boundedFileCollector) Add(file zoekt.FileMatch) {
-	if c.matchLimit > 0 {
-		if c.chunkMatches {
-			limitChunkMatches(&file, c.matchLimit)
-		} else {
-			limitLineMatches(&file, c.matchLimit)
-		}
-	}
+	c.limitFileMatches(&file)
 
 	candidate := retainedFileMatch{sequence: c.nextSequence, match: file}
 	c.nextSequence++
+	c.addScoreLeader(candidate)
+	c.addExtensionLeader(candidate)
+}
 
+func (c *boundedFileCollector) limitFileMatches(file *zoekt.FileMatch) {
+	if c.matchLimit > 0 {
+		if c.chunkMatches {
+			limitChunkMatches(file, c.matchLimit)
+		} else {
+			limitLineMatches(file, c.matchLimit)
+		}
+	}
+}
+
+func (c *boundedFileCollector) addScoreLeader(candidate retainedFileMatch) {
 	c.scoreLeaders = append(c.scoreLeaders, candidate)
 	sortRetainedFiles(c.scoreLeaders)
 	if len(c.scoreLeaders) > c.limit {
 		c.scoreLeaders = c.scoreLeaders[:c.limit]
 	}
+}
 
-	ext := path.Ext(file.FileName)
+func (c *boundedFileCollector) addExtensionLeader(candidate retainedFileMatch) {
+	ext := path.Ext(candidate.match.FileName)
 	for i := range c.extensionLeaders {
 		if path.Ext(c.extensionLeaders[i].match.FileName) != ext {
 			continue

@@ -222,11 +222,6 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 
 nextFileMatch:
 	for {
-		canceled, err := mode.requestState(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
-
 		nextDoc := mt.nextDoc()
 		if int(nextDoc) <= lastDoc {
 			nextDoc = uint32(lastDoc + 1)
@@ -269,15 +264,18 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
-		if canceled {
+		decision, err := mode.beforeDocument(ctx, repoLimited)
+		if err != nil {
+			return nil, nil, err
+		}
+		if decision.canceled {
 			res.Stats.FilesSkipped += int(docCount - nextDoc)
 			break
 		}
-		mode.refreshCountBudget()
-		if mode.shouldStop() {
+		if decision.stop {
 			break
 		}
-		if mode.shouldSkipRepoLimited(repoLimited) {
+		if decision.skip {
 			res.Stats.FilesSkipped++
 			lastDoc = int(nextDoc)
 			continue
@@ -313,86 +311,25 @@ nextFileMatch:
 				continue nextFileMatch
 			}
 		}
-		if _, err := mode.requestState(ctx); err != nil {
-			return nil, nil, err
-		}
-		mode.refreshCountBudget()
-		if mode.shouldStop() {
-			break
-		}
-
 		// Important invariant for performance: finalCands is sorted by offset and
 		// non-overlapping. gatherMatches respects this invariant and all later
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		if err := mode.countDocument(ctx, cp, finalCands); err != nil {
+		decision, err = mode.afterDocumentMatch(ctx, repoLimited, cp, finalCands)
+		if err != nil {
 			return nil, nil, err
 		}
-
-		if !mode.shouldCollectLegacy(repoLimited) {
-			if mode.shouldStop() {
-				break
-			}
+		if decision.stop {
+			break
+		}
+		if !decision.collect {
 			continue
 		}
 
-		fileMatch := zoekt.FileMatch{
-			Repository:         md.Name,
-			RepositoryID:       md.ID,
-			RepositoryPriority: md.GetPriority(),
-			FileName:           string(d.fileName(nextDoc)),
-			Checksum:           d.getChecksum(nextDoc),
-			Language:           d.languageMap[d.getLanguage(nextDoc)],
-		}
-
-		if s := d.subRepos[nextDoc]; s > 0 {
-			if s >= uint32(len(d.subRepoPaths[d.repos[nextDoc]])) {
-				log.Panicf("corrupt index: subrepo %d beyond %v", s, d.subRepoPaths)
-			}
-			path := d.subRepoPaths[d.repos[nextDoc]][s]
-			fileMatch.SubRepositoryPath = path
-			sr := md.SubRepoMap[path]
-			fileMatch.SubRepositoryName = sr.Name
-			if idx := d.branchIndex(nextDoc); idx >= 0 {
-				fileMatch.Version = sr.Branches[idx].Version
-			}
-		} else {
-			idx := d.branchIndex(nextDoc)
-			if idx >= 0 {
-				fileMatch.Version = md.Branches[idx].Version
-			}
-		}
-
-		if opts.ChunkMatches {
-			fileMatch.ChunkMatches = cp.fillChunkMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
-		} else {
-			fileMatch.LineMatches = cp.fillMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
-		}
-
-		if opts.UseBM25Scoring {
-			d.scoreFileBM25(&fileMatch, nextDoc, finalCands, cp, opts)
-		} else {
-			// Use the standard, non-experimental scoring method by default
-			d.scoreFile(&fileMatch, nextDoc, mt, known, opts)
-		}
-
-		fileMatch.Branches = d.gatherBranches(nextDoc, mt, known)
-		sortMatchesByScore(fileMatch.LineMatches)
-		sortChunkMatchesByScore(fileMatch.ChunkMatches)
-		if opts.Whole {
-			fileMatch.Content = cp.data(false)
-		}
-
-		matchedChunkRanges := 0
-		for _, cm := range fileMatch.ChunkMatches {
-			matchedChunkRanges += len(cm.Ranges)
-		}
-
-		repoMatchCount += len(fileMatch.LineMatches)
-		repoMatchCount += matchedChunkRanges
-
-		mode.addLegacyResult(&res, fileMatch, opts)
+		fileMatch, matchCount := d.renderFileMatch(nextDoc, md, mt, known, cp, finalCands, opts)
+		repoMatchCount += matchCount
+		mode.addLegacyResult(&res, fileMatch, matchCount, opts)
 	}
 
 	for _, md := range d.repoMetaData {
@@ -409,6 +346,57 @@ nextFileMatch:
 	res.Stats.MatchTreeSearch = timer.Elapsed()
 
 	return mode.finish(&res, opts)
+}
+
+func (d *indexData) renderFileMatch(nextDoc uint32, md zoekt.Repository, mt matchTree, known map[matchTree]bool, cp *contentProvider, finalCands []*candidateMatch, opts *zoekt.SearchOptions) (zoekt.FileMatch, int) {
+	fileMatch := zoekt.FileMatch{
+		Repository:         md.Name,
+		RepositoryID:       md.ID,
+		RepositoryPriority: md.GetPriority(),
+		FileName:           string(d.fileName(nextDoc)),
+		Checksum:           d.getChecksum(nextDoc),
+		Language:           d.languageMap[d.getLanguage(nextDoc)],
+	}
+
+	if subRepo := d.subRepos[nextDoc]; subRepo > 0 {
+		if subRepo >= uint32(len(d.subRepoPaths[d.repos[nextDoc]])) {
+			log.Panicf("corrupt index: subrepo %d beyond %v", subRepo, d.subRepoPaths)
+		}
+		path := d.subRepoPaths[d.repos[nextDoc]][subRepo]
+		fileMatch.SubRepositoryPath = path
+		subRepoMetadata := md.SubRepoMap[path]
+		fileMatch.SubRepositoryName = subRepoMetadata.Name
+		if idx := d.branchIndex(nextDoc); idx >= 0 {
+			fileMatch.Version = subRepoMetadata.Branches[idx].Version
+		}
+	} else if idx := d.branchIndex(nextDoc); idx >= 0 {
+		fileMatch.Version = md.Branches[idx].Version
+	}
+
+	if opts.ChunkMatches {
+		fileMatch.ChunkMatches = cp.fillChunkMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
+	} else {
+		fileMatch.LineMatches = cp.fillMatches(finalCands, opts.NumContextLines, fileMatch.Language, opts)
+	}
+
+	if opts.UseBM25Scoring {
+		d.scoreFileBM25(&fileMatch, nextDoc, finalCands, cp, opts)
+	} else {
+		d.scoreFile(&fileMatch, nextDoc, mt, known, opts)
+	}
+
+	fileMatch.Branches = d.gatherBranches(nextDoc, mt, known)
+	sortMatchesByScore(fileMatch.LineMatches)
+	sortChunkMatchesByScore(fileMatch.ChunkMatches)
+	if opts.Whole {
+		fileMatch.Content = cp.data(false)
+	}
+
+	matchCount := len(fileMatch.LineMatches)
+	for _, chunk := range fileMatch.ChunkMatches {
+		matchCount += len(chunk.Ranges)
+	}
+	return fileMatch, matchCount
 }
 
 func addRepo(res *zoekt.SearchResult, repo *zoekt.Repository) {

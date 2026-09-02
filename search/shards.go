@@ -615,6 +615,9 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 		}
 		tr.Finish()
 	}()
+	if err := validateExactCountOptions(opts); err != nil {
+		return nil, nil, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if countCtx == nil {
@@ -806,10 +809,151 @@ func (m *shardSearchMode) invalidateCounts() {
 }
 
 func (m *shardSearchMode) exactCounts() *zoekt.ExactSearchCounts {
+	if m.exactRequested() && m.countComplete && m.countCtx.Err() != nil {
+		m.countComplete = false
+	}
 	if !m.exactRequested() || !m.countComplete {
 		return nil
 	}
 	return &m.counts
+}
+
+func validateExactCountOptions(opts *zoekt.SearchOptions) error {
+	normalized := *opts
+	normalized.SetDefaults()
+	if normalized.MaxDocDisplayCount <= 0 && normalized.MaxMatchDisplayCount <= 0 && normalized.ShardMaxMatchCount <= 0 {
+		return zoekt.ErrExactCountRequiresBoundedResults
+	}
+	return nil
+}
+
+type shardSearchWork struct {
+	shard         *rankedShard
+	retainResults bool
+}
+
+type shardSearchResult struct {
+	priority      float64
+	retainResults bool
+	*zoekt.SearchResult
+	exactCounts *zoekt.ExactSearchCounts
+	err         error
+}
+
+type shardSearchCoordinator struct {
+	mode            *shardSearchMode
+	opts            *zoekt.SearchOptions
+	sender          zoekt.Sender
+	shards          []*rankedShard
+	search          chan *shardSearchWork
+	work            chan *shardSearchWork
+	pending         prioritySlice
+	nextShard       int
+	next            *shardSearchWork
+	totalMatchCount int
+}
+
+func newShardSearchCoordinator(mode *shardSearchMode, opts *zoekt.SearchOptions, sender zoekt.Sender, shards []*rankedShard, search chan *shardSearchWork, workers int) *shardSearchCoordinator {
+	return &shardSearchCoordinator{
+		mode:      mode,
+		opts:      opts,
+		sender:    sender,
+		shards:    shards,
+		search:    search,
+		work:      search,
+		pending:   make(prioritySlice, 0, workers),
+		nextShard: 1,
+		next:      &shardSearchWork{shard: shards[0], retainResults: true},
+	}
+}
+
+func (c *shardSearchCoordinator) stop() {
+	if c.work == nil {
+		return
+	}
+	close(c.search)
+	c.work = nil
+	c.next = nil
+}
+
+func (c *shardSearchCoordinator) stopLegacy() {
+	if c.mode.stopLegacyResults() {
+		c.stop()
+	} else if c.next != nil {
+		c.next.retainResults = false
+	}
+}
+
+func (c *shardSearchCoordinator) dispatched() {
+	if c.next.retainResults {
+		c.pending.append(c.next.shard.priority)
+	}
+	if c.nextShard == len(c.shards) {
+		c.stop()
+		return
+	}
+	c.next = &shardSearchWork{
+		shard:         c.shards[c.nextShard],
+		retainResults: c.mode.retainNextResult(),
+	}
+	c.nextShard++
+}
+
+func (c *shardSearchCoordinator) consume(result *shardSearchResult) error {
+	if result.retainResults {
+		c.pending.remove(result.priority)
+	}
+	if result.err != nil {
+		c.stop()
+		return result.err
+	}
+
+	c.mode.observeCounts(result.exactCounts)
+	if result.retainResults {
+		c.totalMatchCount += result.SearchResult.Stats.MatchCount
+		if c.opts.TotalMaxMatchCount > 0 && c.totalMatchCount > c.opts.TotalMaxMatchCount {
+			c.stopLegacy()
+		}
+	}
+
+	observeMetrics(result.SearchResult)
+	if result.retainResults {
+		result.Priority = result.priority
+		result.MaxPendingPriority = c.pending.max()
+		sendByRepository(result.SearchResult, c.opts, c.sender)
+	}
+	if c.mode.shouldStopAfterResult() {
+		c.stop()
+	}
+	return nil
+}
+
+func startShardSearchWorkers(ctx context.Context, workers int, mode *shardSearchMode, q query.Q, opts *zoekt.SearchOptions) (chan *shardSearchWork, <-chan *shardSearchResult) {
+	search := make(chan *shardSearchWork, workers)
+	results := make(chan *shardSearchResult, workers)
+	var wg sync.WaitGroup
+
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for work := range search {
+				sr, counts, err := mode.search(ctx, work.shard.Searcher, q, opts)
+				results <- &shardSearchResult{
+					priority:      work.shard.priority,
+					retainResults: work.retainResults,
+					SearchResult:  sr,
+					exactCounts:   counts,
+					err:           err,
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return search, results
 }
 
 // streamSearch is an internal helper since both Search and StreamSearch are
@@ -865,83 +1009,10 @@ func streamSearchInternal(ctx context.Context, proc *process, q query.Q, opts *z
 	// whichever is smaller.
 	workers := min(runtime.GOMAXPROCS(0), len(shards))
 
-	type shardWork struct {
-		shard         *rankedShard
-		retainResults bool
-	}
-	type result struct {
-		priority      float64
-		retainResults bool
-		*zoekt.SearchResult
-		exactCounts *zoekt.ExactSearchCounts
-		err         error
-	}
-
-	var (
-		// buffered channels to continue searching when sending back results
-		// takes a while / blocks. The maximum pending result set is workers * 2.
-		results = make(chan *result, workers)
-		search  = make(chan *shardWork, workers)
-		wg      sync.WaitGroup
-	)
-
-	// Start workers that receive shards from the search channel, search them,
-	// and send the results to the results channel. This process is repeated
-	// until the search channel is closed.
-	//
-	// Note: Making "search" a buffered channel has the effect of limiting the number of parallel shard searches.
-	// Since searching is mostly CPU bound, limiting parallel shard searches also reduces the peak working set.
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for work := range search {
-				sr, counts, err := mode.search(ctx, work.shard.Searcher, q, opts)
-				r := &result{
-					priority:      work.shard.priority,
-					retainResults: work.retainResults,
-					SearchResult:  sr,
-					exactCounts:   counts,
-					err:           err,
-				}
-				results <- r
-			}
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var (
-		pending = make(prioritySlice, 0, workers)
-		shard   = 0
-		next    = &shardWork{shard: shards[shard], retainResults: true}
-
-		// We need a separate nil-able reference to the same channel so we can close(search) for the worker
-		// go-routines to finish but also set work to nil in order for the select statement below to ignore
-		// that case when we want to stop a search. This is needed because sending on a closed channel panics.
-		work = search
-	)
-
-	stop := func() {
-		if work != nil {
-			close(search)
-			work = nil
-			next = nil
-		}
-	}
-	stopLegacy := func() {
-		if mode.stopLegacyResults() {
-			stop()
-		} else if next != nil {
-			next.retainResults = false
-		}
-	}
-
-	// tracked so we can stop when we hit TotalMaxMatchCount
-	var totalMatchCount int
+	// Buffered work lets shard searches continue while result delivery blocks,
+	// while still bounding concurrent shard memory to the worker count.
+	search, results := startShardSearchWorkers(ctx, workers, mode, q, opts)
+	coordinator := newShardSearchCoordinator(mode, opts, sender, shards, search, workers)
 
 search:
 	for {
@@ -950,57 +1021,15 @@ search:
 		_ = proc.Yield(ctx) // Note: we let searchOneShard handle context errors
 
 		select {
-		case work <- next: // is there a worker available to search the next shard?
-			if next.retainResults {
-				pending.append(next.shard.priority)
-			}
-
-			shard++
-			if shard == len(shards) {
-				stop()
-			} else {
-				next = &shardWork{shard: shards[shard], retainResults: mode.retainNextResult()}
-			}
+		case coordinator.work <- coordinator.next: // is there a worker available to search the next shard?
+			coordinator.dispatched()
 		case r, ok := <-results: // is there a result to send back?
 			if !ok {
 				break search
 			}
-
-			// Delete retained result priority before computing the next display
-			// priority. Count-only shards must not perturb the bounded result's
-			// progress metadata.
-			if r.retainResults {
-				pending.remove(r.priority)
-			}
-
-			if r.err != nil {
-				// Set final error and stop searching new shards, but consume any pending
-				// search results.
-				stop()
-				err = r.err
-				continue
-			}
-			mode.observeCounts(r.exactCounts)
-
-			// Update the match count statistics and stop searching new shards if we've
-			// reached the limit set in the options.
-			if r.retainResults {
-				totalMatchCount += r.SearchResult.Stats.MatchCount
-				if opts.TotalMaxMatchCount > 0 && totalMatchCount > opts.TotalMaxMatchCount {
-					stopLegacy()
-				}
-			}
-
-			observeMetrics(r.SearchResult)
-
-			if r.retainResults {
-				r.Priority = r.priority
-				r.MaxPendingPriority = pending.max()
-
-				sendByRepository(r.SearchResult, opts, sender) // send the result back to the client
-			}
-			if mode.shouldStopAfterResult() {
-				stop()
+			if resultErr := coordinator.consume(r); resultErr != nil {
+				// Stop scheduling new shards but drain results already in flight.
+				err = resultErr
 			}
 		}
 	}

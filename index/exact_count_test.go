@@ -254,6 +254,39 @@ func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	}
 }
 
+func TestIndexSearchModeUsesUntruncatedMatchCountForLegacyLimit(t *testing.T) {
+	opts := &zoekt.SearchOptions{
+		ChunkMatches:         true,
+		ShardMaxMatchCount:   2,
+		MaxDocDisplayCount:   1,
+		MaxMatchDisplayCount: 1,
+	}
+	mode, err := newIndexSearchMode(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := &zoekt.SearchResult{}
+	file := zoekt.FileMatch{
+		FileName: "many.go",
+		ChunkMatches: []zoekt.ChunkMatch{{
+			Ranges: make([]zoekt.Range, 3),
+		}},
+	}
+
+	mode.addLegacyResult(result, file, 3, opts)
+
+	if result.Stats.MatchCount != 3 {
+		t.Fatalf("legacy match count = %d, want untruncated count 3", result.Stats.MatchCount)
+	}
+	if !mode.legacyDone {
+		t.Fatal("legacy traversal did not stop at the untruncated shard match limit")
+	}
+	retained := mode.collector.Files(opts)
+	if len(retained) != 1 || len(retained[0].ChunkMatches) != 1 || len(retained[0].ChunkMatches[0].Ranges) != 1 {
+		t.Fatalf("retained result = %#v, want one display-bounded chunk range", retained)
+	}
+}
+
 func TestSearchWithExactCountRequestCancellationAborts(t *testing.T) {
 	searcher := exactCountSearcherForTest(t,
 		Document{Name: "a.go", Content: []byte("needle\n")},
