@@ -36,6 +36,13 @@ const (
 	indexTraversalCollect
 )
 
+type indexTraversalPoint uint8
+
+const (
+	indexTraversalBeforeDocument indexTraversalPoint = iota
+	indexTraversalAfterMatch
+)
+
 func newIndexSearchMode(countCtx context.Context, opts *zoekt.SearchOptions) (*indexSearchMode, error) {
 	mode := &indexSearchMode{countCtx: countCtx}
 	if countCtx == nil {
@@ -53,82 +60,48 @@ func (m *indexSearchMode) exactRequested() bool {
 	return m.countCtx != nil
 }
 
-func (m *indexSearchMode) refreshCountBudget() {
-	if m.countComplete && m.countCtx.Err() != nil {
-		m.countComplete = false
-	}
-}
-
-func (m *indexSearchMode) requestState(ctx context.Context) (canceled bool, err error) {
-	err = ctx.Err()
-	if err != nil && m.exactRequested() {
-		return false, err
-	}
-	return err != nil, nil
-}
-
-func (m *indexSearchMode) shouldStop() bool {
-	return m.legacyDone && !m.countComplete
-}
-
 func (m *indexSearchMode) shouldSkipRepoLimited(repoLimited bool) bool {
 	return repoLimited && !m.countComplete
 }
 
-func (m *indexSearchMode) shouldCollectLegacy(repoLimited bool) bool {
-	return !m.legacyDone && !repoLimited
-}
-
-func (m *indexSearchMode) beforeDocument(ctx context.Context) (indexTraversalAction, error) {
-	canceled, err := m.requestState(ctx)
-	if err != nil {
-		return indexTraversalContinue, err
-	}
-	if canceled {
-		return indexTraversalCanceled, nil
-	}
-	m.refreshCountBudget()
-	if m.shouldStop() {
-		return indexTraversalStop, nil
-	}
-	return indexTraversalContinue, nil
-}
-
-func (m *indexSearchMode) afterDocumentMatch(ctx context.Context, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalAction, error) {
-	if _, err := m.requestState(ctx); err != nil {
-		return indexTraversalContinue, err
-	}
-	m.refreshCountBudget()
-	if m.shouldStop() {
-		return indexTraversalStop, nil
-	}
-	if err := m.countDocument(ctx, cp, matches); err != nil {
-		return indexTraversalContinue, err
-	}
-	if !m.shouldCollectLegacy(repoLimited) {
-		if m.shouldStop() {
-			return indexTraversalStop, nil
+func (m *indexSearchMode) advanceTraversal(ctx context.Context, point indexTraversalPoint, repoLimited bool, cp *contentProvider, matches []*candidateMatch) (indexTraversalAction, error) {
+	if err := ctx.Err(); err != nil {
+		if m.exactRequested() {
+			return indexTraversalContinue, err
 		}
+		if point == indexTraversalBeforeDocument {
+			return indexTraversalCanceled, nil
+		}
+	}
+	if m.countComplete && m.countCtx.Err() != nil {
+		m.countComplete = false
+	}
+	if m.legacyDone && !m.countComplete {
+		return indexTraversalStop, nil
+	}
+	if point == indexTraversalBeforeDocument {
+		return indexTraversalContinue, nil
+	}
+
+	if m.countComplete {
+		lineCount, complete, err := countSourceLines(ctx, m.countCtx, cp, matches)
+		if err != nil {
+			return indexTraversalContinue, err
+		}
+		if !complete {
+			m.countComplete = false
+		} else {
+			m.counts.MatchCount += lineCount
+			m.counts.FileCount++
+		}
+	}
+	if m.legacyDone && !m.countComplete {
+		return indexTraversalStop, nil
+	}
+	if m.legacyDone || repoLimited {
 		return indexTraversalContinue, nil
 	}
 	return indexTraversalCollect, nil
-}
-
-func (m *indexSearchMode) countDocument(ctx context.Context, cp *contentProvider, matches []*candidateMatch) error {
-	if !m.countComplete {
-		return nil
-	}
-	lineCount, complete, err := countSourceLines(ctx, m.countCtx, cp, matches)
-	if err != nil {
-		return err
-	}
-	if !complete {
-		m.countComplete = false
-		return nil
-	}
-	m.counts.MatchCount += lineCount
-	m.counts.FileCount++
-	return nil
 }
 
 func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt.FileMatch, matchCount int, opts *zoekt.SearchOptions) {
@@ -145,11 +118,18 @@ func (m *indexSearchMode) addLegacyResult(result *zoekt.SearchResult, file zoekt
 	}
 }
 
-func (m *indexSearchMode) finish(result *zoekt.SearchResult, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
+func (m *indexSearchMode) finish(ctx context.Context, result *zoekt.SearchResult, opts *zoekt.SearchOptions) (*zoekt.SearchResult, *zoekt.ExactSearchCounts, error) {
 	if m.collector != nil {
 		result.Files = m.collector.Files(opts)
 	}
-	m.refreshCountBudget()
+	if m.exactRequested() {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+	if m.countComplete && m.countCtx.Err() != nil {
+		m.countComplete = false
+	}
 	if m.countComplete {
 		return result, &m.counts, nil
 	}

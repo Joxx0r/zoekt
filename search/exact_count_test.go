@@ -161,7 +161,7 @@ func TestNewShardSearchCoordinatorHandlesNoShards(t *testing.T) {
 }
 
 func TestShardSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
-	countCtx := newShardErrAfterContext(1)
+	countCtx := newErrAfterContext(1)
 	mode := newExactShardSearchMode(countCtx)
 	mode.counts = zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}
 
@@ -283,7 +283,7 @@ func TestDirectorySearcherExposesExactCountContract(t *testing.T) {
 	}
 }
 
-type shardErrAfterContext struct {
+type errAfterContext struct {
 	context.Context
 	allowed int
 	calls   int
@@ -291,7 +291,7 @@ type shardErrAfterContext struct {
 	err     error
 }
 
-func (c *shardErrAfterContext) Err() error {
+func (c *errAfterContext) Err() error {
 	if c.err != nil {
 		return c.err
 	}
@@ -303,12 +303,12 @@ func (c *shardErrAfterContext) Err() error {
 	return c.err
 }
 
-func (c *shardErrAfterContext) Done() <-chan struct{} {
+func (c *errAfterContext) Done() <-chan struct{} {
 	return c.done
 }
 
-func newShardErrAfterContext(allowed int) *shardErrAfterContext {
-	return &shardErrAfterContext{
+func newErrAfterContext(allowed int) *errAfterContext {
+	return &errAfterContext{
 		Context: context.Background(),
 		allowed: allowed,
 		done:    make(chan struct{}),

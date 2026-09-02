@@ -266,7 +266,7 @@ func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	}
 	mode.counts = zoekt.ExactSearchCounts{MatchCount: 1, FileCount: 1}
 
-	result, counts, err := mode.finish(&zoekt.SearchResult{}, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
+	result, counts, err := mode.finish(context.Background(), &zoekt.SearchResult{}, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,6 +275,22 @@ func TestIndexSearchModeRechecksBudgetBeforePublishingCounts(t *testing.T) {
 	}
 	if counts != nil {
 		t.Fatalf("counts = %#v, want unavailable after final budget check", counts)
+	}
+}
+
+func TestIndexSearchModeRechecksRequestBeforePublishingResult(t *testing.T) {
+	mode, err := newIndexSearchMode(context.Background(), &zoekt.SearchOptions{MaxDocDisplayCount: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestCtx := newErrAfterContext(0)
+
+	result, counts, err := mode.finish(requestCtx, &zoekt.SearchResult{}, &zoekt.SearchOptions{MaxDocDisplayCount: 1})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if result != nil || counts != nil {
+		t.Fatalf("result/counts = %#v/%#v, want no partial response", result, counts)
 	}
 }
 

@@ -537,71 +537,29 @@ func doSelectRepoSet(shards []*rankedShard, and *query.And) ([]*rankedShard, que
 }
 
 func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
-	tr, ctx := trace.New(ctx, "shardedSearcher.Search", "")
-	tr.LazyLog(q, true)
-	tr.LazyPrintf("opts: %+v", opts)
-	defer func() {
-		if sr != nil {
-			tr.LazyPrintf("num files: %d", len(sr.Files))
-			tr.LazyPrintf("stats: %+v", sr.Stats)
-		}
-		if err != nil {
-			tr.LazyPrintf("error: %v", err)
-			tr.SetError(err)
-		}
-		tr.Finish()
-	}()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	collectSender := newCollectSender(opts)
-
-	start := time.Now()
-	proc, err := ss.sched.Acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer proc.Release()
-	tr.LazyPrintf("acquired process")
-
-	wait := time.Since(start)
-	start = time.Now()
-
-	loaded := ss.getLoaded()
-	done, err := streamSearch(ctx, proc, q, opts, loaded.shards, collectSender)
-	if err != nil {
-		if done != nil {
-			done()
-		}
-		return nil, err
-	}
-	if done != nil {
-		defer done()
-	}
-
-	aggregate, ok := collectSender.Done()
-	if !ok {
-		aggregate = &zoekt.SearchResult{
-			RepoURLs:      map[string]string{},
-			LineFragments: map[string]string{},
-		}
-	}
-
-	copyFiles(aggregate)
-
-	if !loaded.ready {
-		// We may have missed results due to not being fully loaded.
-		aggregate.Stats.Crashes++
-	}
-
-	aggregate.Stats.Wait = wait
-	aggregate.Stats.Duration = time.Since(start)
-
-	return aggregate, nil
+	sr, _, err = ss.search(ctx, nil, q, opts)
+	return sr, err
 }
 
 func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
-	tr, ctx := trace.New(ctx, "shardedSearcher.SearchWithExactCount", "")
+	if err := validateExactCountOptions(opts); err != nil {
+		return nil, nil, err
+	}
+	if countCtx == nil {
+		countCtx = context.Background()
+	}
+	return ss.search(ctx, countCtx, q, opts)
+}
+
+func (ss *shardedSearcher) search(ctx, countCtx context.Context, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, counts *zoekt.ExactSearchCounts, err error) {
+	traceName := "shardedSearcher.Search"
+	mode := newLegacyShardSearchMode()
+	if countCtx != nil {
+		traceName = "shardedSearcher.SearchWithExactCount"
+		mode = newExactShardSearchMode(countCtx)
+	}
+
+	tr, ctx := trace.New(ctx, traceName, "")
 	tr.LazyLog(q, true)
 	tr.LazyPrintf("opts: %+v", opts)
 	defer func() {
@@ -615,17 +573,10 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 		}
 		tr.Finish()
 	}()
-	if err := validateExactCountOptions(opts); err != nil {
-		return nil, nil, err
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if countCtx == nil {
-		countCtx = context.Background()
-	}
 
 	collectSender := newCollectSender(opts)
-	mode := newExactShardSearchMode(countCtx)
 
 	start := time.Now()
 	proc, err := ss.sched.Acquire(ctx)
@@ -667,6 +618,11 @@ func (ss *shardedSearcher) SearchWithExactCount(ctx, countCtx context.Context, q
 
 	aggregate.Stats.Wait = wait
 	aggregate.Stats.Duration = time.Since(start)
+	if countCtx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
 	counts = mode.exactCounts()
 
 	return aggregate, counts, nil

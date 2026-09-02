@@ -160,13 +160,8 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 	}
 
 	var res zoekt.SearchResult
-	if mode.exactRequested() {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-	}
 	if len(d.fileNameIndex) == 0 {
-		return mode.finish(&res, opts)
+		return mode.finish(ctx, &res, opts)
 	}
 
 	select {
@@ -181,12 +176,12 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 
 	q = d.simplify(q)
 	if c, ok := q.(*query.Const); ok && !c.Value {
-		return mode.finish(&res, opts)
+		return mode.finish(ctx, &res, opts)
 	}
 
 	if opts.EstimateDocCount && !mode.exactRequested() {
 		res.Stats.ShardFilesConsidered = len(d.fileBranchMasks)
-		return mode.finish(&res, opts)
+		return mode.finish(ctx, &res, opts)
 	}
 
 	q = query.Map(q, query.ExpandFileContent)
@@ -206,7 +201,7 @@ func (d *indexData) search(ctx, countCtx context.Context, q query.Q, opts *zoekt
 	res.Stats.MatchTreeConstruction = timer.Elapsed()
 	if mt == nil {
 		res.Stats.ShardsSkippedFilter++
-		return mode.finish(&res, opts)
+		return mode.finish(ctx, &res, opts)
 	}
 
 	res.Stats.ShardsScanned++
@@ -269,7 +264,7 @@ nextFileMatch:
 		if nextDoc >= docCount {
 			break
 		}
-		action, err := mode.beforeDocument(ctx)
+		action, err := mode.advanceTraversal(ctx, indexTraversalBeforeDocument, repoLimited, nil, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -316,7 +311,7 @@ nextFileMatch:
 		// transformations respect this.
 		finalCands := d.gatherMatches(nextDoc, mt, known)
 
-		action, err = mode.afterDocumentMatch(ctx, repoLimited, cp, finalCands)
+		action, err = mode.advanceTraversal(ctx, indexTraversalAfterMatch, repoLimited, cp, finalCands)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -345,7 +340,7 @@ nextFileMatch:
 
 	res.Stats.MatchTreeSearch = timer.Elapsed()
 
-	return mode.finish(&res, opts)
+	return mode.finish(ctx, &res, opts)
 }
 
 func (d *indexData) renderFileMatch(nextDoc uint32, md zoekt.Repository, mt matchTree, known map[matchTree]bool, cp *contentProvider, finalCands []*candidateMatch, opts *zoekt.SearchOptions) (zoekt.FileMatch, int) {
