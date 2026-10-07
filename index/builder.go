@@ -111,6 +111,14 @@ type Options struct {
 	// Sourcegraph specific option.
 	ShardMerging bool
 
+	// DisableFileClassification skips go-enry classification for corpora
+	// that are not source code: language detection, file categories, and
+	// the generated, vendored and test signals of the document order.
+	// Documents keep an explicit Language, and every non-binary document
+	// gets FileCategoryDefault. It does not change the options hash, so
+	// delta builds may mix with shards built without it.
+	DisableFileClassification bool
+
 	// HeapProfileTriggerBytes is the heap allocation in bytes that will trigger a memory profile. If 0, no memory profile
 	// will be triggered. Note this trigger looks at total heap allocation (which includes both inuse and garbage objects).
 	//
@@ -866,23 +874,29 @@ type rankedDoc struct {
 // at query time, because earlier documents receive a boost at query time and
 // have a higher chance of being searched before limits kick in.
 func rank(d *Document, origIdx int) []float64 {
+	return rankClassified(d, origIdx, true)
+}
+
+// rankClassified is rank; without classify, the go-enry generated, vendored
+// and test signals are zero.
+func rankClassified(d *Document, origIdx int, classify bool) []float64 {
 	skipped := 0.0
 	if d.SkipReason != SkipReasonNone {
 		skipped = 1.0
 	}
 
 	generated := 0.0
-	if enry.IsGenerated(d.Name, d.Content) {
+	if classify && enry.IsGenerated(d.Name, d.Content) {
 		generated = 1.0
 	}
 
 	vendor := 0.0
-	if enry.IsVendor(d.Name) {
+	if classify && enry.IsVendor(d.Name) {
 		vendor = 1.0
 	}
 
 	test := 0.0
-	if enry.IsTest(d.Name) {
+	if classify && enry.IsTest(d.Name) {
 		test = 1.0
 	}
 
@@ -918,9 +932,13 @@ func rank(d *Document, origIdx int) []float64 {
 }
 
 func sortDocuments(todo []*Document) {
+	sortDocumentsClassified(todo, true)
+}
+
+func sortDocumentsClassified(todo []*Document, classify bool) {
 	rs := make([]rankedDoc, 0, len(todo))
 	for i, t := range todo {
-		rd := rankedDoc{t, rank(t, i)}
+		rd := rankedDoc{t, rankClassified(t, i, classify)}
 		rs = append(rs, rd)
 	}
 	sort.Slice(rs, func(i, j int) bool {
@@ -960,7 +978,7 @@ func (b *Builder) buildShard(todo []*Document, nextShardNum int) (*finishedShard
 		return nil, err
 	}
 
-	sortDocuments(todo)
+	sortDocumentsClassified(todo, !b.opts.DisableFileClassification)
 
 	for idx, t := range todo {
 		if err := shardBuilder.Add(*t); err != nil {
@@ -1018,6 +1036,7 @@ func (b *Builder) newShardBuilder() (*ShardBuilder, error) {
 	}
 	shardBuilder.IndexTime = b.indexTime
 	shardBuilder.ID = b.id
+	shardBuilder.disableFileClassification = b.opts.DisableFileClassification
 	return shardBuilder, nil
 }
 

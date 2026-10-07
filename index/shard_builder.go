@@ -204,6 +204,9 @@ type ShardBuilder struct {
 	// language => language code
 	languageMap map[string]uint16
 
+	// disableFileClassification is Options.DisableFileClassification.
+	disableFileClassification bool
+
 	// language codes, uint16 encoded as little-endian
 	languages []uint8
 
@@ -430,8 +433,16 @@ func (b *ShardBuilder) Add(doc Document) error {
 		doc.SymbolsMetaData = nil
 	}
 
-	DetermineLanguageIfUnknown(&doc)
-	DetermineFileCategory(&doc)
+	if b.disableFileClassification {
+		if doc.SkipReason == SkipReasonBinary {
+			doc.Category = FileCategoryBinary
+		} else if doc.Category == FileCategoryMissing {
+			doc.Category = FileCategoryDefault
+		}
+	} else {
+		DetermineLanguageIfUnknown(&doc)
+		DetermineFileCategory(&doc)
+	}
 
 	sort.Sort(symbolSlice{doc.Symbols, doc.SymbolsMetaData})
 	var last DocumentSection
